@@ -15,6 +15,28 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Added
 
+- **OpenAI-compatible HTTP TTS can describe the raw PCM it returns.**
+  `chat.TTSConfig` now has `SampleRate` and `Channels` for the signed PCM16
+  little-endian body (`response_format` stays `pcm`; there is no WAV decode
+  or backend format negotiation). A zero sample rate defaults to 24000 Hz;
+  a zero channel count defaults to 1. Emitted `TTSAudioRawFrame` metadata
+  uses that rate and channel count. Other providers and `PCMYielder` are
+  unchanged. `examples/voice/custom` exposes `TTS_SAMPLE_RATE` (default
+  24000) and `TTS_CHANNELS` (default 1). The rate must be a positive
+  integer; this example accepts channel count 1 only, because the transport
+  resampler does not downmix stereo to mono. Playback stays 48 kHz and
+  resamples from the frame metadata; STT remains independent at 16 kHz.
+- **The Opus decoder can emit PCM at the pipeline's input sample rate.**
+  `audio/opus.NewDecoderWithOutput(rate, channels)` builds a decoder at that
+  rate; `NewDecoder` still defaults to 48 kHz. The WebRTC transport now
+  selects that output from the resolved input sample rate, so decoded PCM
+  already matches STT with no extra pipeline resampler.
+  `examples/voice/custom` defaults to 16 kHz mono (`STT_SAMPLE_RATE=16000`,
+  `STT_CHANNELS=1`). Allowed rates are 8000, 12000, 16000, 24000 and 48000.
+  A channel count other than 1 fails at startup, because STT, VAD and
+  turn-taking are mono. Playback stays 48 kHz.
+  VAD may resample rates it does not natively run. A browser or codec may
+  still resample internally.
 - **Semgrep static analysis.** The security workflow runs Semgrep Community
   Edition with the Go ruleset and reports its findings to the Security tab
   without failing the build. `make sast` runs the same scan locally.
@@ -198,52 +220,51 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   and called a config callback. It is now a `voicemail.Detector` placed after
   the STT service, with a `TTSGate` (from `Gate`) placed after the TTS service.
   After each transcription the detector asks its `Classifier` whether a person
-  answered or the call went to voicemail, and keeps asking as more is said.
-  Once the caller has been quiet for `DecisionTimeout` (1s by default) the
-  latest answer decides; with no answer at all it assumes a conversation. Until
-  then the gate holds the bot's speech back. A conversation verdict releases
-  it and raises `on_conversation_detected`. A voicemail verdict drops it,
-  interrupts the bot, lets only the frames that end or control the pipeline
-  through, and raises `on_voicemail_detected` once the greeting has been quiet
-  for `VoicemailResponseDelay` (2s by default). Both handlers get the detector
-  as their source, to push frames through. The classifier's metrics are pushed
-  as `MetricsFrame`s. `frames.WorkerFrame` marks the worker frames.
-  **Breaking:** `Config` no longer has `OnVoicemailDetected`,
-  `OnConversationDetected` or `VoicemailDelay`, `New` returns an error, and the
-  gate has to be placed in the pipeline. `Config.LLM` and
-  `Config.CustomSystemPrompt` build an LLM classifier and are deprecated from
-  the start; pass a classifier instead.
+  answered or the call went to voicemail, and keeps asking as more is said. Once
+  the caller has been quiet for `DecisionTimeout` (1s by default) the latest
+  answer decides; with no answer at all it assumes a conversation. Until then
+  the gate holds the bot's speech back. A conversation verdict releases it and
+  raises `on_conversation_detected`. A voicemail verdict drops it, interrupts
+  the bot, lets only the frames that end or control the pipeline through, and
+  raises `on_voicemail_detected` once the greeting has been quiet for
+  `VoicemailResponseDelay` (2s by default). Both handlers get the detector as
+  their source, to push frames through. The classifier's metrics are pushed as
+  `MetricsFrame`s. `frames.WorkerFrame` marks the worker frames. **Breaking:**
+  `Config` no longer has `OnVoicemailDetected`, `OnConversationDetected` or
+  `VoicemailDelay`, `New` returns an error, and the gate has to be placed in the
+  pipeline. `Config.LLM` and `Config.CustomSystemPrompt` build an LLM classifier
+  and are deprecated from the start; pass a classifier instead.
 
-- **The eval judge decides with a classifier, and asks an LLM for the
-  reasons.** `eval.NewEvalJudge` builds an `EvalJudge` over a `Classifier`: a
-  reply is judged `yes`, `no` or `continue` with the conversation before it and
-  the reply sent apart, a tool call `yes` or `no` by its name and arguments.
+- **The eval judge decides with a classifier, and asks an LLM for the reasons.**
+  `eval.NewEvalJudge` builds an `EvalJudge` over a `Classifier`: a reply is
+  judged `yes`, `no` or `continue` with the conversation before it and the reply
+  sent apart, a tool call `yes` or `no` by its name and arguments.
   `JudgeVerdict` gained `Confidence`, and a verdict's reason starts out as the
   probabilities the classifier gave (`P(yes)=0.97`). A classifier gives no
   reasons, so an `Explainer` LLM is asked for them: for every `no`, and for a
-  `yes` less sure than `ExplainBelow` (0.75 by default), never for a
-  `continue`. It never changes a verdict; when it disagrees, the reason says so.
+  `yes` less sure than `ExplainBelow` (0.75 by default), never for a `continue`.
+  It never changes a verdict; when it disagrees, the reason says so.
   `AllowContinue: false` judges a reply `yes` or `no` only. A question that
-  fails is asked once more before it gives a `no`. The judge sets its
-  classifier up before its first question, and a run closes it however it
-  ends. `jargo eval` gained `--judge-explainer`, `--judge-explain-below` and
-  `--judge-allow-continue`. **Breaking:** `LLMJudge` is gone and
-  `NewLLMJudge`, now deprecated, returns an `*EvalJudge` that classifies
-  through an LLM classifier and explains with the same service. A borderline
-  reply can get a different verdict than before.
+  fails is asked once more before it gives a `no`. The judge sets its classifier
+  up before its first question, and a run closes it however it ends.
+  `jargo eval` gained `--judge-explainer`, `--judge-explain-below` and
+  `--judge-allow-continue`. **Breaking:** `LLMJudge` is gone and `NewLLMJudge`,
+  now deprecated, returns an `*EvalJudge` that classifies through an LLM
+  classifier and explains with the same service. A borderline reply can get a
+  different verdict than before.
 
-- **Sentences end where the language spoken says they do.** Sentence
-  boundaries now come from per-language segmentation rules built into jargo,
-  with abbreviation lists for some thirty languages and fallbacks for the rest,
-  so no model is loaded at startup. A TTS service splits its text in the
-  language of its settings: `tts.Base.TextAggregationLanguage` reports it, and
-  a settings update that changes the language switches the aggregator with it
-  (a cleared language falls back to English). `text.MatchEndOfSentence` takes
-  the language, and `text.ResolveSentenceTokenizerLanguage` normalizes a code
-  such as `pt-BR` to the one the rules use. **Breaking:** the Punkt tokenizer
-  is gone: `text.SentenceTokenizer`, `PunktTokenizer`, the `NewPunkt`
-  constructors, `tts.Base.TextTokenizer` and `aggregators.NewSentenceWith` are
-  removed. `text.NewSimpleAggregator`, `NewPatternPairAggregator` and
+- **Sentences end where the language spoken says they do.** Sentence boundaries
+  now come from per-language segmentation rules built into jargo, with
+  abbreviation lists for some thirty languages and fallbacks for the rest, so no
+  model is loaded at startup. A TTS service splits its text in the language of
+  its settings: `tts.Base.TextAggregationLanguage` reports it, and a settings
+  update that changes the language switches the aggregator with it (a cleared
+  language falls back to English). `text.MatchEndOfSentence` takes the language,
+  and `text.ResolveSentenceTokenizerLanguage` normalizes a code such as `pt-BR`
+  to the one the rules use. **Breaking:** the Punkt tokenizer is gone:
+  `text.SentenceTokenizer`, `PunktTokenizer`, the `NewPunkt` constructors,
+  `tts.Base.TextTokenizer` and `aggregators.NewSentenceWith` are removed.
+  `text.NewSimpleAggregator`, `NewPatternPairAggregator` and
   `NewSkipTagsAggregator` take a language in place of a tokenizer, the
   `text.Aggregator` interface gained `Language` and `SetLanguage`, and
   `RegisterSpoken` on the aggregated frame sequencer takes the language.
@@ -297,13 +318,13 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   thing spread over a directory of near-identical files. `eval.LoadFile` reads a
   file and returns every scenario it holds, `jargo eval run` and a suite
   manifest play them all, and a file whose scenario keys sit at the top level
-  with no `scenarios:` still loads as the one scenario it describes.
-  `eval.Load` now refuses a file holding several rather than running the first.
+  with no `scenarios:` still loads as the one scenario it describes. `eval.Load`
+  now refuses a file holding several rather than running the first.
 
 - **A scenario can put a tool call to the judge.** An `eval:` on a
   `function_call` expectation is now a criterion about the call rather than
-  about the bot's words: each call the expectation matches is put to the judge by
-  name and arguments, with the conversation so far as context, which is how a
+  about the bot's words: each call the expectation matches is put to the judge
+  by name and arguments, with the conversation so far as context, which is how a
   scenario checks what an `args:` subset cannot match verbatim ("a session about
   tracing, submitted for the right person"). The judge gets instructions of its
   own for a call, since a call is not a partial reply: the verdict is yes or no,
@@ -349,8 +370,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   to, where the models before it waited by default, so a synchronous tool on one
   of them left the model talking over its own result. A tool registered to
   outlive the reply that asked for it is now declared `NON_BLOCKING`, and its
-  result carries the `WHEN_IDLE` schedule, so a result landing late has the model
-  finish its sentence before turning to it. A synchronous tool is declared
+  result carries the `WHEN_IDLE` schedule, so a result landing late has the
+  model finish its sentence before turning to it. A synchronous tool is declared
   `BLOCKING` wherever the model takes that, which restores the semantics it had.
   The Live thinking models accept only `NON_BLOCKING`: a synchronous tool cannot
   pause the conversation there, and that is reported once per session.
@@ -371,10 +392,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Fixed
 
-- **AWS Nova Sonic defaults to `amazon.nova-2-sonic-v1:0`.** Bedrock removed
-  the first-generation `amazon.nova-sonic-v1:0` and rejects requests naming
-  it, so a `Config` with no `Model` failed to connect. The `Region` and `Voice`
-  docs now list the regions and voices Nova 2 Sonic supports.
+- **AWS Nova Sonic defaults to `amazon.nova-2-sonic-v1:0`.** Bedrock removed the
+  first-generation `amazon.nova-sonic-v1:0` and rejects requests naming it, so a
+  `Config` with no `Model` failed to connect. The `Region` and `Voice` docs now
+  list the regions and voices Nova 2 Sonic supports.
 
 - **NVIDIA and Together LLMs default to models their endpoints still serve.**
   `nvidia.NewLLM` now defaults to `nvidia/nemotron-3-super-120b-a12b` (the old
@@ -383,10 +404,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   `Model` to choose another.
 
 - **Together TTS escapes the voice and sends the language.** Kokoro blended
-  voices such as `af_bella(2)+af_heart(1)` reached the server with `+` read as
-  a space and were rejected. `TTSConfig` gains a `Language`, defaulting to
-  English and sent as the code Together accepts (`zh-hk` for Hong Kong
-  Chinese), so voices are no longer always synthesized in English.
+  voices such as `af_bella(2)+af_heart(1)` reached the server with `+` read as a
+  space and were rejected. `TTSConfig` gains a `Language`, defaulting to English
+  and sent as the code Together accepts (`zh-hk` for Hong Kong Chinese), so
+  voices are no longer always synthesized in English.
 
 - **DeepSeek requests after a tool call no longer fail, and thinking is off by
   default.** This breaks the public API.
@@ -404,36 +425,36 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 - **xAI speech-to-text no longer transcribes each utterance twice.** Chunk
   finals now arrive as interim transcriptions, and only the utterance final,
-  which restates the whole utterance, is a finalized transcription that ends
-  the turn.
+  which restates the whole utterance, is a finalized transcription that ends the
+  turn.
 
 - **xAI realtime accepts an 11025 Hz sample rate.** `realtime.Config.SampleRate`
   now validates 11025, and the 21050 Hz entry, which the API does not support,
   is no longer accepted.
 
 - **Gradium speech-to-text keeps the words it heard when the connection drops.**
-  The words already received are delivered as a transcription before the
-  session reconnects, without ending the turn, and the new session starts
-  clean. A session shut down on purpose still discards them.
+  The words already received are delivered as a transcription before the session
+  reconnects, without ending the turn, and the new session starts clean. A
+  session shut down on purpose still discards them.
 
 - **Gradium speech-to-text works at sample rates other than 8, 16 and 24 kHz.**
-  PCM at any other rate was announced as 16 kHz but sent at its real rate, so
-  it was transcribed at the wrong speed. It is now resampled to the lowest
-  accepted rate at or above the pipeline's, or 24 kHz above that.
+  PCM at any other rate was announced as 16 kHz but sent at its real rate, so it
+  was transcribed at the wrong speed. It is now resampled to the lowest accepted
+  rate at or above the pipeline's, or 24 kHz above that.
 
 - **Gladia reports rejected audio chunks and failed translations.** An
-  `audio_chunk` Gladia did not acknowledge and a `translation` carrying an
-  error were silently dropped. Both now surface as non-fatal error frames
-  while transcription continues on the same connection.
+  `audio_chunk` Gladia did not acknowledge and a `translation` carrying an error
+  were silently dropped. Both now surface as non-fatal error frames while
+  transcription continues on the same connection.
 
 - **AssemblyAI recognizes `universal-3-6-pro` and uses it by default.** The
   model is treated as U3 Pro, so declared `LanguageCodes` reach it. An empty
   `Model` now sends `universal-3-6-pro` rather than leaving `speech_model`
   unset, which had the declared languages silently dropped.
 
-- **AssemblyAI rejects a prompt on models that do not take one, and steers
-  more languages.** `Config.Validate` returns an error when `Prompt` is set for
-  a model that is not U3 Pro, rather than the session failing on the server.
+- **AssemblyAI rejects a prompt on models that do not take one, and steers more
+  languages.** `Config.Validate` returns an error when `Prompt` is set for a
+  model that is not U3 Pro, rather than the session failing on the server.
   `LanguageCodes` now covers Russian, Korean, Catalan, Galician, Romanian,
   Estonian, Persian, Cantonese, Afrikaans, Marathi, Zulu, Xhosa and Norwegian
   Nynorsk, which were dropped before.
@@ -455,38 +476,38 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   "minimal", their lowest effort, and the `-pro` models and `gpt-6.1-sol` are
   left at the provider's default.
 
-- **A failed STT keepalive no longer stops the keepalives.** The keepalive
-  gave up on its first failed send and was only restarted when a new session
-  opened, so an idle connection could be closed by the provider. A failed
-  keepalive is now logged and the next one is sent on schedule. The keepalive
-  runs for the whole connection, across the sessions the read loop reopens,
-  rather than being restarted with each one.
+- **A failed STT keepalive no longer stops the keepalives.** The keepalive gave
+  up on its first failed send and was only restarted when a new session opened,
+  so an idle connection could be closed by the provider. A failed keepalive is
+  now logged and the next one is sent on schedule. The keepalive runs for the
+  whole connection, across the sessions the read loop reopens, rather than being
+  restarted with each one.
 
 - **TTS audio frames always hold whole samples.** A provider can cut its PCM
   stream at any byte, and an audio frame ending mid-sample broke whatever read
   audio frame by frame downstream (resamplers, filters, metrics). The TTS base
   now holds the partial sample back and puts it in front of the context's next
-  frame, so every frame it emits is sample-aligned. A partial sample left at
-  the end of a context is zero-padded and played before the stop frame; one
-  left by an interruption or a timed-out context is dropped.
+  frame, so every frame it emits is sample-aligned. A partial sample left at the
+  end of a context is zero-padded and played before the stop frame; one left by
+  an interruption or a timed-out context is dropped.
 
 - **A tool re-declared with a new handler runs the new one.** A toolset that
   advertised a tool under a name it had advertised before, carrying a different
-  handler, left the old handler registered: the name was still advertised, so
-  it was never dropped, and it was already claimed, so the new handler was
-  skipped. The model was told it was calling the new tool while the old one
-  answered. A handler registered from a toolset is now rebound when the tool
-  carries a different one. The same handler advertised again is left alone, and
-  a handler registered by hand is never replaced.
+  handler, left the old handler registered: the name was still advertised, so it
+  was never dropped, and it was already claimed, so the new handler was skipped.
+  The model was told it was calling the new tool while the old one answered. A
+  handler registered from a toolset is now rebound when the tool carries a
+  different one. The same handler advertised again is left alone, and a handler
+  registered by hand is never replaced.
 
 - **A failed WebSocket dial no longer writes an API key into the log.** The Go
   HTTP client spells the whole URL out in a dial error, and two providers put
   their key in the query, so a refused connection, a DNS failure or a TLS
-  problem logged the credential with the error. Gemini Live now sends its key
-  in the `x-goog-api-key` header, as Google's own SDK does, and its URL carries
-  none. `wsutil.Dial` also leaves the query, the user info and the fragment
-  out of the error it returns, keeping the host and the cause, which covers
-  Async, whose WebSocket API takes the key in the query.
+  problem logged the credential with the error. Gemini Live now sends its key in
+  the `x-goog-api-key` header, as Google's own SDK does, and its URL carries
+  none. `wsutil.Dial` also leaves the query, the user info and the fragment out
+  of the error it returns, keeping the host and the cause, which covers Async,
+  whose WebSocket API takes the key in the query.
 
 - **A segmented STT service transcribes when the VAD stops, not when the turn
   ends.** `stt.SegmentService` cut its segments on `UserStartedSpeakingFrame`
@@ -497,17 +518,17 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   `VADUserStartedSpeakingFrame` and `VADUserStoppedSpeakingFrame`. The last
   second of audio before the VAD reports speech is kept at the start of the
   segment, since the VAD reports it a little late. Segments are transcribed in
-  order on one background task: an `EndFrame` transcribes what is queued
-  before it goes on, and a `CancelFrame` drops it. **Behaviour change:** a
-  segmented service now needs voice activity detection in the pipeline, from
-  `vadproc` or the user aggregator's VAD; turn frames alone no longer drive it.
-  `vadproc` also logs the start and end of speech at debug level.
+  order on one background task: an `EndFrame` transcribes what is queued before
+  it goes on, and a `CancelFrame` drops it. **Behaviour change:** a segmented
+  service now needs voice activity detection in the pipeline, from `vadproc` or
+  the user aggregator's VAD; turn frames alone no longer drive it. `vadproc`
+  also logs the start and end of speech at debug level.
 
 - **An ellipsis no longer splits a sentence between its dots.** The sentence
   aggregator took the second dot of `...` as the text confirming a boundary, so
   `respect... Vous` came out as `respect..` and a lone `.`, which a provider
-  that validates its input rejects, leaving the turn silent. Punctuation after
-  a candidate boundary is now part of the same mark rather than lookahead. The
+  that validates its input rejects, leaving the turn silent. Punctuation after a
+  candidate boundary is now part of the same mark rather than lookahead. The
   lookahead also retries a boundary the tokenizer cannot settle at the first
   character once the following word ends, and never at a partial word, so
   `Albert I. Do` is not checked before `Douglas` is complete. Whether an
@@ -571,8 +592,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   nothing has happened since.** The assistant aggregator decided from the frame
   alone: every call registered with `CancelOnInterruption` false had its result
   appended as an async-tool developer message, on the assumption that the
-  conversation had moved past the call. It now decides from the conversation.
-  A result that arrives before a user or developer message follows the call's
+  conversation had moved past the call. It now decides from the conversation. A
+  result that arrives before a user or developer message follows the call's
   placeholder is indistinguishable from one the model waited for, so the
   placeholder becomes the result and no deferred message is written at all. The
   model's own output does not defer it, so filler spoken with a `TTSSpeakFrame`
@@ -632,8 +653,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 - **`on_user_turn_idle` fires after a user turn with nothing transcribed.** The
   turn's start canceled the idle timer and, with no reply to follow it, nothing
-  restarted it. The timer now starts again after such a turn, unless the turn
-  is answered.
+  restarted it. The timer now starts again after such a turn, unless the turn is
+  answered.
 
 ## [0.2.0] - 2026-09-18
 
@@ -641,8 +662,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 - **The output resampler's stream boundaries are marked rather than guessed.**
   `resample.Resampler.Flush` emits the audio the converter is still holding in
-  its filter and clears it, for a stream that has ended, and `Clear` discards it,
-  for one that was abandoned. `resample.Config.ClearAfter` gained
+  its filter and clears it, for a stream that has ended, and `Clear` discards
+  it, for one that was abandoned. `resample.Config.ClearAfter` gained
   `resample.NeverClear`, which turns the idle window off for a caller that marks
   those boundaries itself.
 
@@ -685,12 +706,12 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   every VAD and end-of-turn test skip itself, while this one negotiates with
   whatever runtime it finds.
 
-- **Time to first answer token separates thinking from answering.** A model
-  that reasons before it replies streams something well before the first token
-  the caller sees, so time to first byte stopped describing how quickly it
-  answered. `frames.TTFATMetricsData` measures from the same request start to
-  that first answer token, and carries the time to first byte it builds on and
-  the thinking time between them, so the split reads from one record.
+- **Time to first answer token separates thinking from answering.** A model that
+  reasons before it replies streams something well before the first token the
+  caller sees, so time to first byte stopped describing how quickly it answered.
+  `frames.TTFATMetricsData` measures from the same request start to that first
+  answer token, and carries the time to first byte it builds on and the thinking
+  time between them, so the split reads from one record.
   `observers.ServiceMetrics` reports it as the `ttfat` kind. A turn answering
   with a tool call ends the measurement at the call; a speech-to-speech service
   reports none, having no answer token to measure to.
@@ -728,25 +749,25 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   whether that was a service, a setting, the bot's own code or the pipeline
   between them, so "where did the turn go" is answerable without matching on
   names. Time nothing accounts for is reported as pipeline time rather than
-  quietly absorbed, which is what makes a gap visible.
-  `TurnContributionLines` renders it, in order or by cost.
-  `LatencyConfig.Now` and `MinContribution` tune the clock and the threshold
-  below which a stretch is a frame hop rather than work worth naming.
+  quietly absorbed, which is what makes a gap visible. `TurnContributionLines`
+  renders it, in order or by cost. `LatencyConfig.Now` and `MinContribution`
+  tune the clock and the threshold below which a stretch is a frame hop rather
+  than work worth naming.
 
 - **Four observers report what a session did, as it happens.**
   `observers.Errors` reports each failure where it is raised rather than where
   it ends up, so a session's history holds the ones a switcher recovered from as
   well as the ones that surfaced, each named for the processor that raised it
-  and carrying whether that processor can still do its job.
-  `observers.Speaking` reports the conversation's speaking lifecycle moment by
-  moment, with the user at two layers: the speech the detector heard, where a
-  cough or a false start appears and stops, and the turn strategy's ruling on
-  it, which is what the pipeline acts on. `observers.FunctionCalls` reports each
-  call when it starts, when it goes in progress and when it settles, saying
-  which of the four ways it settled and whether the conversation was waiting on
-  it. `observers.ServiceMetrics` turns each metric a service publishes into its
-  own record, summing nothing, so a consumer groups by turn, session or model as
-  it needs. What a turn is, and what a total is, stay with whoever reads the
+  and carrying whether that processor can still do its job. `observers.Speaking`
+  reports the conversation's speaking lifecycle moment by moment, with the user
+  at two layers: the speech the detector heard, where a cough or a false start
+  appears and stops, and the turn strategy's ruling on it, which is what the
+  pipeline acts on. `observers.FunctionCalls` reports each call when it starts,
+  when it goes in progress and when it settles, saying which of the four ways it
+  settled and whether the conversation was waiting on it.
+  `observers.ServiceMetrics` turns each metric a service publishes into its own
+  record, summing nothing, so a consumer groups by turn, session or model as it
+  needs. What a turn is, and what a total is, stay with whoever reads the
   records: a policy that ships inside a record can never be revised.
 - **The startup report separates getting ready from starting.**
   `StartupTimingReport.SetupPhase` and `StartPhase` split the total, which
@@ -761,16 +782,16 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   call is no longer indistinguishable from one that returned that sentence on
   purpose.
 - **RTVI reports what the bot is saying, segment by segment.** The `bot-output`
-  message was missing entirely: a client had the model's raw text and the
-  spoken captions, and nothing tying them together. Each unit of the bot's
-  output is now reported with how it was aggregated, an id, whether the
-  synthesizer is going to speak it, and where it has got to in playback, with
-  the accumulated and remaining text split at the word being said. A unit is
-  reported from the transport that plays it rather than from the service that
-  produced it, so its timing is that of what the caller hears, and one produced
-  before the bot is audible is held until its audio starts. A client of the
-  older protocol generation, which has no notion of progress within a segment,
-  is told about each word as output in its own right instead.
+  message was missing entirely: a client had the model's raw text and the spoken
+  captions, and nothing tying them together. Each unit of the bot's output is
+  now reported with how it was aggregated, an id, whether the synthesizer is
+  going to speak it, and where it has got to in playback, with the accumulated
+  and remaining text split at the word being said. A unit is reported from the
+  transport that plays it rather than from the service that produced it, so its
+  timing is that of what the caller hears, and one produced before the bot is
+  audible is held until its audio starts. A client of the older protocol
+  generation, which has no notion of progress within a segment, is told about
+  each word as output in its own right instead.
   `ObserverParams.BotOutputEnabled` turns the category off and
   `SkipAggregatorTypes` keeps chosen aggregation types from the client
   altogether, captions included.
@@ -814,21 +835,22 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   for the cases where a plain request is easier to operate.
 - **Cartesia markup helpers.** `cartesia.Spell`, `EmotionTag`, `PauseTag`,
   `VolumeTag` and `SpeedTag` build the markup Cartesia reads inside the text it
-  is given, alongside the `Emotion` set it recognizes. The service holds off on a
-  sentence boundary inside a spell tag, so one reaching it whole is synthesized
-  whole.
+  is given, alongside the `Emotion` set it recognizes. The service holds off on
+  a sentence boundary inside a spell tag, so one reaching it whole is
+  synthesized whole.
 - **Speech-to-speech mode in the user aggregator.** A realtime LLM service now
   says so when it describes itself at start (OpenAI Realtime, xAI Realtime,
   Gemini Live and Nova Sonic all do), and the aggregator changes two things when
-  one does. The turn strategies lose their transcript dependence: a transcript no
-  longer opens a turn, and no stop strategy holds one open waiting for one, since
-  the service is answering the audio and the transcript only delays the turn. And
-  the user's message is written to the conversation when the assistant starts
-  answering rather than when the turn ends, because such a service delivers the
-  transcript late, sometimes only once it has begun answering; the write waits
-  one published transcript-latency window, and the answer completing takes it
-  regardless. `aggregators.WithRealtimeServiceMode` forces the mode on for a
-  service that does not announce itself, or off to keep the cascaded behavior.
+  one does. The turn strategies lose their transcript dependence: a transcript
+  no longer opens a turn, and no stop strategy holds one open waiting for one,
+  since the service is answering the audio and the transcript only delays the
+  turn. And the user's message is written to the conversation when the assistant
+  starts answering rather than when the turn ends, because such a service
+  delivers the transcript late, sometimes only once it has begun answering; the
+  write waits one published transcript-latency window, and the answer completing
+  takes it regardless. `aggregators.WithRealtimeServiceMode` forces the mode on
+  for a service that does not announce itself, or off to keep the cascaded
+  behavior.
 - **`turn.NewHTTPSmartTurn`, an end-of-turn analyzer that asks a remote
   service.** It buffers and segments the turn's audio the way the local analyzer
   does and posts that segment as a NumPy array for scoring, for a deployment
@@ -836,10 +858,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   silence window to answer in; one that outruns it, like any other failure,
   leaves the turn to the stop-seconds safety net rather than cutting the user
   off.
-- **`processor.FrameLogger` and `processor.AsyncGeneratorProcessor`.** The
-  first logs each frame and its direction, skipping the ones that arrive many
-  times a second; the second passes frames through and serializes each for a
-  reader outside the pipeline.
+- **`processor.FrameLogger` and `processor.AsyncGeneratorProcessor`.** The first
+  logs each frame and its direction, skipping the ones that arrive many times a
+  second; the second passes frames through and serializes each for a reader
+  outside the pipeline.
 
 ### Removed
 
@@ -864,9 +886,9 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 - **`TTSTextFrame` is an aggregated frame.** It now embeds
   `AggregatedTextFrame`, so a chunk of spoken text carries how it was
-  aggregated, which synthesis context produced it and whether it will be
-  spoken, alongside the text and its raw form. A service that reports word
-  timings emits word-aggregated frames and one that does not emits a single
+  aggregated, which synthesis context produced it and whether it will be spoken,
+  alongside the text and its raw form. A service that reports word timings emits
+  word-aggregated frames and one that does not emits a single
   sentence-aggregated frame per unit, which is what lets a consumer tell a
   caption to render from a word to highlight within it. `AggregatedTextFrame`
   also reports its own name rather than `TextFrame`. **Breaking:**
@@ -876,10 +898,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   off, alongside the `Reset` that clears the buffer deliberately. The three
   aggregators shipped here discard the buffer either way, so nothing about a
   pipeline built from them changes; what is new is that a custom aggregator can
-  now treat the two differently, which it had no way to express before, since the
-  interruption reached it as a plain reset. `text.Aggregator` also declares the
-  `Text` accessor its implementations already had. **Breaking:** an aggregator
-  outside this module has to add `HandleInterruption`.
+  now treat the two differently, which it had no way to express before, since
+  the interruption reached it as a plain reset. `text.Aggregator` also declares
+  the `Text` accessor its implementations already had. **Breaking:** an
+  aggregator outside this module has to add `HandleInterruption`.
 - **Cartesia synthesis takes settings while the pipeline runs.** The voice, the
   model, the language, the generation controls and the pronunciation dictionary
   can all change mid-call. Cartesia fixes the first three for the length of a
@@ -889,14 +911,14 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   others go out on the next request.
 - **Cartesia synthesis holds one connection open for the session.** It dialed a
   new WebSocket for every sentence, paying a TLS handshake in front of each one
-  and losing the ability to stream a turn as a single utterance. It now opens the
-  connection when the pipeline starts and gives each turn a context of its own on
-  it: the sentences of a turn are sent on that context and flushed once the last
-  has gone, so the turn streams continuously, and audio the server had already
-  generated for a turn the user cut off is dropped by its context id rather than
-  spoken over the next one. An interruption tells Cartesia to stop generating
-  into the context. The reader dials again when Cartesia drops a connection idle
-  for five minutes, so the socket stays warm.
+  and losing the ability to stream a turn as a single utterance. It now opens
+  the connection when the pipeline starts and gives each turn a context of its
+  own on it: the sentences of a turn are sent on that context and flushed once
+  the last has gone, so the turn streams continuously, and audio the server had
+  already generated for a turn the user cut off is dropped by its context id
+  rather than spoken over the next one. An interruption tells Cartesia to stop
+  generating into the context. The reader dials again when Cartesia drops a
+  connection idle for five minutes, so the socket stays warm.
 - **`cartesia.Config.VoiceID` is required!** It defaulted to a public Cartesia
   voice, which had jargo choosing what the bot sounds like. Cartesia has no
   default voice, so the caller names one; `examples/voice/cartesia` shows the
@@ -929,7 +951,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   chain. `LLMSwitcher` now carries it.
 - **Idle detection counts provider turn frames.** A pipeline whose turns come
   from the provider pushes no `UserSpeakingFrame`, so a talking user looked idle
-  and was cancelled. Transcriptions and `UserStartedSpeakingFrame` now count too.
+  and was cancelled. Transcriptions and `UserStartedSpeakingFrame` now count
+  too.
 - **The `libopus` and `libsoxr` cgo backends are gone.** Both were opt-in C
   alternatives to the pure-Go Opus encoder and resampler, from when the pure-Go
   SILK encoder was new. The pure-Go path is the one that gets used and measured,
@@ -1008,17 +1031,17 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   what lets a reply be generated from the prediction and withdrawn when the user
   turns out to be mid-sentence.
 
-- **The summarization message window counts the right messages.** It
-  discounted one message unconditionally, so before the first summary a window
-  of twenty compressed at nineteen, and after one it depended on what the
-  conversation happened to hold. The preamble and the summary are now identified
-  rather than assumed, and both are worked out from the conversation as it
-  stands, so replacing the messages resets the window with them.
+- **The summarization message window counts the right messages.** It discounted
+  one message unconditionally, so before the first summary a window of twenty
+  compressed at nineteen, and after one it depended on what the conversation
+  happened to hold. The preamble and the summary are now identified rather than
+  assumed, and both are worked out from the conversation as it stands, so
+  replacing the messages resets the window with them.
 
-- **Punctuation no longer shifts the text around it or is recorded twice.**
-  The original text now carries two cursors rather than one: what has been
-  reported spoken, which stops in front of a mark no event has arrived for, and
-  what has been attributed, which takes a mark stuck to the end of the word. A
+- **Punctuation no longer shifts the text around it or is recorded twice.** The
+  original text now carries two cursors rather than one: what has been reported
+  spoken, which stops in front of a mark no event has arrived for, and what has
+  been attributed, which takes a mark stuck to the end of the word. A
   synthesizer reporting `","` on its own, after `"Yeah"` already took the comma
   into its span, now records nothing rather than storing the mark a second time,
   and `"Yeah,"` then `"I"` reads back correctly where `"Yeah"` then `", I"` put
@@ -1057,15 +1080,16 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   another worker wait for the same moment, so a tool that closes the call is not
   cut off mid-call. `DeferToolFrames` turns the holding off.
 
-  A handler is recognized by the context it was given, so anything it passes that
-  context to is part of the call, and what another worker queues is not. Tools are
-  declared as `frames.Tool` values and registered with the call options they
-  carry; one with no handler is advertised without being registered.
+  A handler is recognized by the context it was given, so anything it passes
+  that context to is part of the call, and what another worker queues is not.
+  Tools are declared as `frames.Tool` values and registered with the call
+  options they carry; one with no handler is advertised without being
+  registered.
 
 - **A worker can address a worker in another process.** `workers/proxy` carries
-  bus messages over a WebSocket: `proxy.NewClient` dials, `proxy.NewServer` takes
-  an accepted connection, and each sits on its own bus as an ordinary worker.
-  Neither of the workers they join knows the other is remote.
+  bus messages over a WebSocket: `proxy.NewClient` dials, `proxy.NewServer`
+  takes an accepted connection, and each sits on its own bus as an ordinary
+  worker. Neither of the workers they join knows the other is remote.
 
   What crosses is deliberately narrow. A message addressed to the worker on the
   far side crosses and nothing else does, so a bus carrying a conversation's
@@ -1090,8 +1114,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
   `bus.TypeRegistry` is what resolves those names, and `bus.Types` is the
   process-wide one every built-in bus message and frame registers in. It stands
-  in for reading a type out of a module path at run time, which Go cannot do:
-  a type that may cross a bus names itself in advance, and one that never
+  in for reading a type out of a module path at run time, which Go cannot do: a
+  type that may cross a bus names itself in advance, and one that never
   registered is refused on arrival rather than silently arriving as something
   else. Register your own with `bus.Types.Register`.
 
@@ -1104,9 +1128,9 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 - **`jargo eval run` takes directories.** A directory argument stands for the
   scenarios directly in it, in name order, taking both the `.yaml` and `.yml`
-  suffixes a manifest resolves. A directory holding no scenario is refused rather
-  than quietly contributing nothing, since a run that plays nothing reads like a
-  run that passed.
+  suffixes a manifest resolves. A directory holding no scenario is refused
+  rather than quietly contributing nothing, since a run that plays nothing reads
+  like a run that passed.
 
   A scenario that will not load now fails on its own instead of ending the run:
   it is reported as `FAIL <name> (failed to load: …)` and counted, and the rest
@@ -1115,8 +1139,9 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - **`wsserver.Params.SessionTimeout` bounds how long one session may run.** When
   it elapses with the socket still open, `wsserver.EventSessionTimeout` fires on
   the transport. Nothing is closed by it: a call that has gone on too long
-  usually wants to be told so before the pipeline ends, rather than being cut off
-  mid-sentence. Zero, the default, leaves a session to run as long as it likes.
+  usually wants to be told so before the pipeline ends, rather than being cut
+  off mid-sentence. Zero, the default, leaves a session to run as long as it
+  likes.
 
 - **`tts.EventTTSRequest` announces each unit on its way to the synthesizer.**
   It fires just before the provider is asked, carrying a `tts.TTSRequest` with
@@ -1154,8 +1179,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   - `disconnect-bot`, which ends the pipeline gracefully.
   - `llm-function-call-result`, the result of a tool the client ran on the bot's
     behalf, delivered to the conversation as an ordinary result frame.
-  - `raw-audio` and `raw-audio-batch`, for a client that does its own capture and
-    feeds the pipeline over the message channel rather than a media track.
+  - `raw-audio` and `raw-audio-batch`, for a client that does its own capture
+    and feeds the pipeline over the message channel rather than a media track.
 
   A message of a type the bot does not know, and one carrying the RTVI label but
   nothing readable, are now answered with `error-response` and `error`. A client
@@ -1164,17 +1189,18 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - **The Twilio hang-up can be addressed to a regional edge, or elsewhere
   entirely.** `twilio.Config` gained `Region` and `Edge`, which give the host
   `api.{Edge}.{Region}.twilio.com`, and `BaseURL`, an API root used as it stands
-  for a Twilio-compatible or self-hosted backend. The hang-up was previously sent
-  to Twilio's global host whatever the call, so a call carried on a regional edge
-  was asked about at a host that does not have it. Twilio's host format needs
-  both halves, so naming one without the other is refused at `Setup`.
+  for a Twilio-compatible or self-hosted backend. The hang-up was previously
+  sent to Twilio's global host whatever the call, so a call carried on a
+  regional edge was asked about at a host that does not have it. Twilio's host
+  format needs both halves, so naming one without the other is refused at
+  `Setup`.
 
 - **A telephony call is hung up when the pipeline ends, unless told not to.**
-  `AutoHangUp` on the Twilio, Telnyx and Plivo serializers is now a `*bool` whose
-  nil default ends the call: a pipeline that has finished otherwise leaves the
-  caller listening to silence, and the leg billing, until something else hangs
-  up. Set it to `false` for a bot that is one step of a longer call the provider
-  goes on to route elsewhere.
+  `AutoHangUp` on the Twilio, Telnyx and Plivo serializers is now a `*bool`
+  whose nil default ends the call: a pipeline that has finished otherwise leaves
+  the caller listening to silence, and the leg billing, until something else
+  hangs up. Set it to `false` for a bot that is one step of a longer call the
+  provider goes on to route elsewhere.
 
   Each `Config` gained a `Validate` method, run at `Setup`: a serializer that is
   to hang up with no credentials to authorize it now fails when the pipeline
@@ -1184,20 +1210,20 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - **The WebSocket server transport can be told which origins to admit.**
   `wsserver.Params` now carries the media parameters and the ones only a server
   serving its own socket has, `AllowedOrigins` being the first. Empty, the
-  default, allows every origin, which is what a phone provider needs: it is not a
-  browser and sends no `Origin` header. Naming origins admits only those, matched
-  whole and without regard to case, and turns away a request carrying no origin,
-  with `wsserver.ErrOriginNotAllowed` and no reply written. It is the guard
-  against a page on another site opening the socket in a visitor's browser and
-  holding a conversation as them. `utils/security.IsOriginAllowed` is the check
-  itself, for an endpoint doing its own upgrade.
+  default, allows every origin, which is what a phone provider needs: it is not
+  a browser and sends no `Origin` header. Naming origins admits only those,
+  matched whole and without regard to case, and turns away a request carrying no
+  origin, with `wsserver.ErrOriginNotAllowed` and no reply written. It is the
+  guard against a page on another site opening the socket in a visitor's browser
+  and holding a conversation as them. `utils/security.IsOriginAllowed` is the
+  check itself, for an endpoint doing its own upgrade.
 
   `wsserver.Accept` now takes a `wsserver.Params`; `wsserver.DefaultParams()`
   builds one.
 
 - **A user turn processor.** `turns.NewUserTurnProcessor` decides the user's
-  turn in a processor of its own, so the decision can be made once and shared
-  by several aggregators, or placed at a particular point in the pipeline. The
+  turn in a processor of its own, so the decision can be made once and shared by
+  several aggregators, or placed at a particular point in the pipeline. The
   aggregator keeps its own turn taking for the usual case, where the decision
   belongs on the same frames as the aggregation.
 
@@ -1233,11 +1259,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   application error, because speaking the untransformed text would defeat one
   that exists to take something out.
 
-- **A way of grouping text can go unspoken.**
-  `tts.Base.SetSkipAggregatorTypes` names aggregation types whose units are
-  passed downstream unsynthesized, in their place among the units around them.
-  It is how a pattern aggregator's own types are kept out of the speech: a block
-  of code reads terribly aloud but still belongs in the transcript.
+- **A way of grouping text can go unspoken.** `tts.Base.SetSkipAggregatorTypes`
+  names aggregation types whose units are passed downstream unsynthesized, in
+  their place among the units around them. It is how a pattern aggregator's own
+  types are kept out of the speech: a block of code reads terribly aloud but
+  still belongs in the transcript.
 
 - **A provider that needs a trailing space gets one.** A synthesizer that
   implements `tts.TrailingSpaceRequirer` has a space appended to sentence-sized
@@ -1284,26 +1310,27 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   vendor into `moshi` and `pockettts` named the packages after the servers, and
   moshi-server is not a Kyutai product: it is the binary that serves the Delayed
   Streams Modeling STT and TTS models, and it is named after Moshi, a different
-  model altogether that jargo does not provide. So the package is the vendor, the
-  way `deepgram` holds both its own line and Flux. `moshi.NewSTT`, `moshi.NewTTS`
-  and `moshi.Config`/`moshi.TTSConfig` become `kyutai.NewSTT`, `kyutai.NewTTS`
-  and `kyutai.Config`/`kyutai.TTSConfig`; `pockettts.NewTTS` and
+  model altogether that jargo does not provide. So the package is the vendor,
+  the way `deepgram` holds both its own line and Flux. `moshi.NewSTT`,
+  `moshi.NewTTS` and `moshi.Config`/`moshi.TTSConfig` become `kyutai.NewSTT`,
+  `kyutai.NewTTS` and `kyutai.Config`/`kyutai.TTSConfig`; `pockettts.NewTTS` and
   `pockettts.Config`, which would have collided, take the product prefix as
   `kyutai.NewPocketTTS` and `kyutai.PocketTTSConfig`. Nothing about the services
   themselves changed, the processor names `KyutaiSTT`, `KyutaiTTS` and
   `PocketTTS` included, so metrics and logs read as before.
 
 - **Provider defaults tracked upstream.** Cartesia's default TTS model is now
-  `sonic-3.6`. Gradium STT transcribes English by default rather than leaving the
-  server to decide, and `gradium.AnyLanguage` asks it to detect the language.
-  Anthropic turns thinking off by default on Sonnet 5 and later, which otherwise
-  decide per request whether to think and can spend seconds on it before the
-  first answer token; Opus and Fable are left at Anthropic's own default, and
-  configuring `Thinking` explicitly still wins. `anthropic.ThinkingConfig` gained
-  `Display`, which asks for readable thinking on the models that omit it by
-  default. Cerebras now sends developer-role messages as written rather than
-  converting them to user messages: it maps the role to its own developer
-  instruction layer, which sits above user instructions.
+  `sonic-3.6`. Gradium STT transcribes English by default rather than leaving
+  the server to decide, and `gradium.AnyLanguage` asks it to detect the
+  language. Anthropic turns thinking off by default on Sonnet 5 and later, which
+  otherwise decide per request whether to think and can spend seconds on it
+  before the first answer token; Opus and Fable are left at Anthropic's own
+  default, and configuring `Thinking` explicitly still wins.
+  `anthropic.ThinkingConfig` gained `Display`, which asks for readable thinking
+  on the models that omit it by default. Cerebras now sends developer-role
+  messages as written rather than converting them to user messages: it maps the
+  role to its own developer instruction layer, which sits above user
+  instructions.
 
 - **Deepgram Flux TTS streams the model's tokens** rather than grouping them
   into sentences first, which is what Flux is for: synthesis starts on the first
@@ -1351,8 +1378,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   fill gradient tracking how much of the user's turn has arrived: `●` complete,
   `◐` cut off mid-thought, `○` still thinking. Each is a single token in every
   major tokenizer, which matters because the complete marker is generated ahead
-  of any speakable text. Note the short and long markers swapped characters, so a
-  system prompt written by hand against the old set needs updating.
+  of any speakable text. Note the short and long markers swapped characters, so
+  a system prompt written by hand against the old set needs updating.
   `llm.UserTurnCompletionConfig` gained `CompleteMarker`,
   `IncompleteShortMarker` and `IncompleteLongMarker`, and every prompt is
   rendered from whichever set is in force. The assistant aggregator strips the
@@ -1379,15 +1406,15 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   messages and the runner's exit path sent them again, so an ordinary shutdown
   told each worker twice and replaced the caller's reason with a generic one.
   Cancel now records why and signals the shutdown, and the messages go out from
-  the one exit path, carrying that reason. Both shutdown messages now reach every
-  worker that has not finished: one that never started has not finished either,
-  so it is still owed the message.
+  the one exit path, carrying that reason. Both shutdown messages now reach
+  every worker that has not finished: one that never started has not finished
+  either, so it is still owed the message.
 
 - **A write to the transport is bounded.** A peer that stops reading blocks the
   write on socket buffers that never drain. Nothing about that is an error a
   transport can report, so the write never returned: the audio loop parked, the
-  bot went silent, the queue grew without limit, and the frame ending the session
-  was stranded inside the transport. A write that exceeds
+  bot went silent, the queue grew without limit, and the frame ending the
+  session was stranded inside the transport. A write that exceeds
   `transport.Params.AudioOutWriteTimeout` (10 seconds by default) now reports a
   permanent connectivity error, which costs the transport its usability and
   leaves the worker's unusable-processor policy to decide what happens to the
@@ -1396,10 +1423,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 - **A failed opening turn no longer leaves the user muted.**
   `turns.MuteUntilFirstBotComplete` released the mute when the bot finished
-  speaking. A first turn that produced no audio never reported that, and no later
-  turn could, since a muted user cannot prompt one. An error arriving before the
-  bot starts speaking now releases the mute too; errors after that point are left
-  alone, since the transport ends the turn on its own once the audio dries up.
+  speaking. A first turn that produced no audio never reported that, and no
+  later turn could, since a muted user cannot prompt one. An error arriving
+  before the bot starts speaking now releases the mute too; errors after that
+  point are left alone, since the transport ends the turn on its own once the
+  audio dries up.
 
 - **A session's controllers are stopped once and released once.** The turn
   processor cleaned its controllers up from the end-of-session handler and again
@@ -1434,16 +1462,16 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   The wait is no longer a flat timeout but a budget for quiet:
   `pipeline.FlushNoProgressTimeout` (5 seconds) of nothing reaching the sink and
   no report from a pipeline holding the probe. One that keeps working keeps the
-  wait alive however long it takes. `Flush` returns `pipeline.ErrFlushNoProgress`
-  when it gives up.
+  wait alive however long it takes. `Flush` returns
+  `pipeline.ErrFlushNoProgress` when it gives up.
 
 - **A flush that crosses into another worker is reported on.** A probe answered
   in another pipeline is out of sight of the worker waiting on it, which could
   only read the quiet as a pipeline gone stuck. The pipeline holding it now says
   it is still working, once a second, over a new `bus.FlushProgressMessage`.
   `pipeline.WorkerConfig.HandleFlushFrame` says whether a worker answers a probe
-  at all, defaulting to whether its pipeline is unbridged, so a worker wired into
-  someone else's topology leaves the probe to the pipeline that owns the
+  at all, defaulting to whether its pipeline is unbridged, so a worker wired
+  into someone else's topology leaves the probe to the pipeline that owns the
   transport.
 
 - **A worker drains its pipeline before ending or handing over.** `Worker.End`
@@ -1462,9 +1490,9 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   permanent error instead: it stops being given work, a switcher can fail over,
   and the pipeline worker applies its unusable-processor policy.
   `tts.Base.SetZeroAudioContextLimit` sets how many, defaulting to three; zero
-  reports silence without ever writing the service off. An interrupted context is
-  abandoned rather than completed, so it is not counted, and a service brought
-  back with `SetUsable(true)` starts the count over.
+  reports silence without ever writing the service off. An interrupted context
+  is abandoned rather than completed, so it is not counted, and a service
+  brought back with `SetUsable(true)` starts the count over.
 
 - **The TTS pause watchdog is gone, and with it the pause it existed to break.**
   Frame handling is now paused only while there is playback to wait for: the bot
@@ -1474,9 +1502,9 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   `tts.PauseOptions.WatchdogTimeout` is deprecated and unused.
 
 - **`frames.ErrorSource` reports whether the processor can still do its job.**
-  Three places documented reading `ErrorFrame.Source.Usable()` to get the verdict
-  that came with an error, and the interface exposed only `Name()`, so none of
-  them compiled.
+  Three places documented reading `ErrorFrame.Source.Usable()` to get the
+  verdict that came with an error, and the interface exposed only `Name()`, so
+  none of them compiled.
 
 - **A turn ends on the signal that ends it, not on a timer.** A service with its
   own end-of-turn detection pushes the final transcript and then proposes the
@@ -1494,8 +1522,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   turn from the boundaries the service reports. None of them reported any, so
   the strategies they asked for were never given anything to resolve and no turn
   ever started or ended. Flux reports the start of a turn and its end, Ink-2 its
-  `turn.start` and `turn.end`, and the Realtime session the speech boundaries its
-  server-side detector finds. A turn whose words came back below Flux's
+  `turn.start` and `turn.end`, and the Realtime session the speech boundaries
+  its server-side detector finds. A turn whose words came back below Flux's
   confidence floor, or that Ink-2 ended with nothing said, still reports the
   boundary: only the empty text is left out.
 
@@ -1517,9 +1545,9 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - **Proposed turn boundaries are resolved.** A service that detects speech
   server-side now proposes the boundary rather than announcing it, and the
   external turn strategies resolve the proposal: they emit the turn frames and
-  broadcast the interruption, which is what puts the barge-in decision back
-  with the pipeline. A proposal is consumed by whatever resolves it, so no
-  resolver further along decides the same turn twice. Deepgram Flux, Gladia and
+  broadcast the interruption, which is what puts the barge-in decision back with
+  the pipeline. A proposal is consumed by whatever resolves it, so no resolver
+  further along decides the same turn twice. Deepgram Flux, Gladia and
   Cartesia's turn endpoint gained a `ShouldInterrupt` setting, routed into the
   strategies they recommend.
 
@@ -1528,12 +1556,12 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   finalization. It now always runs the strategies, defaulting to voice activity
   and transcription to start and a speech timeout to stop.
 
-- **A wake phrase matches through punctuation,** so a service reporting
-  "Hey, Jargo!" wakes a bot listening for "hey jargo". Single activation also
-  no longer sleeps on the turn it just opened: the keepalive window is what
-  puts the strategy back to sleep, so the turn the phrase opened can run.
-  `WakePhraseStartConfig` gained callbacks for the phrase being detected and
-  for the strategy going back to sleep.
+- **A wake phrase matches through punctuation,** so a service reporting "Hey,
+  Jargo!" wakes a bot listening for "hey jargo". Single activation also no
+  longer sleeps on the turn it just opened: the keepalive window is what puts
+  the strategy back to sleep, so the turn the phrase opened can run.
+  `WakePhraseStartConfig` gained callbacks for the phrase being detected and for
+  the strategy going back to sleep.
 
 - **An externally driven turn ends on a late transcript.** The stop strategy
   waited one debounce window for transcript text and gave up, leaving the turn
@@ -1560,8 +1588,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   Processors are now set up concurrently, each failure is pushed as its own
   error frame, and the processor is left unusable: setting up is not attempted
   again, so a switcher settles on the backup before the pipeline starts. The
-  pipeline also pays for its slowest processor rather than for all of them
-  added together.
+  pipeline also pays for its slowest processor rather than for all of them added
+  together.
 
 - **A pipeline that never comes up stops instead of hanging.** A processor that
   blocked while connecting, or while handling the `StartFrame`, left the worker
@@ -1573,15 +1601,15 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 - **Startup timing counts the time a processor spends connecting.** Observers
   gain `OnProcessorSetup`, so the report now covers setup as well as start: a
-  processor that spent two seconds connecting was previously reported as
-  costing nothing. The total is the span from the pipeline starting to set up
-  rather than the sum of what each processor cost, since they are set up
-  concurrently, and transport timing no longer waits for the `StartFrame`, so a
-  client that connects during setup is measured.
+  processor that spent two seconds connecting was previously reported as costing
+  nothing. The total is the span from the pipeline starting to set up rather
+  than the sum of what each processor cost, since they are set up concurrently,
+  and transport timing no longer waits for the `StartFrame`, so a client that
+  connects during setup is measured.
 
-- **A processor's shared components are published atomically.** Frames can
-  reach a processor while it is still being set up, and the fields setting up
-  writes were read straight from the frame path.
+- **A processor's shared components are published atomically.** Frames can reach
+  a processor while it is still being set up, and the fields setting up writes
+  were read straight from the frame path.
 
 - **Typographic punctuation no longer collapses the rest of a spoken frame.**
   The word matcher folded case and accents but not typographic punctuation, so a
@@ -1609,11 +1637,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   keeps a decimal agreeing with the plural unit beside it.
 
 - **Time to first byte is measured to the model's first output.** Six LLM
-  streams stopped it as soon as the HTTP response or the stream object was
-  open, which is a response header arriving, not the model answering; the
-  Responses WebSocket stopped it on the event that merely acknowledges the
-  request. Anthropic, Gemini, OpenAI chat and both Responses transports now stop
-  it on the first event carrying output, skipping a usage-only chunk, a
+  streams stopped it as soon as the HTTP response or the stream object was open,
+  which is a response header arriving, not the model answering; the Responses
+  WebSocket stopped it on the event that merely acknowledges the request.
+  Anthropic, Gemini, OpenAI chat and both Responses transports now stop it on
+  the first event carrying output, skipping a usage-only chunk, a
   `message_start` and a `response.created`. A turn that only calls a tool still
   reports a TTFB, and reasoning counts as output.
 
@@ -1673,15 +1701,16 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   observing all of it.
 
 - **The aggregators report the turns they assemble.** The user half raises
-  `EventUserTurnStarted`, `EventUserTurnStopped`, `EventUserTurnInferenceTriggered`,
-  `EventUserTurnStopTimeout`, `EventUserTurnIdle`, `EventUserTurnMessageAdded`,
-  `EventUserMuteStarted` and `EventUserMuteStopped`; the assistant half raises
-  `EventAssistantTurnStarted`, `EventAssistantTurnStopped` and
-  `EventAssistantThought`. The assistant half also announces a finished turn to
-  the pipeline as an `LLMContextAssistantTurnFrame`, and stamps each message it
-  writes with an `LLMContextAssistantTimestampFrame`. Both frames were declared
-  but never emitted. The turn-completion markers are stripped from what is
-  reported, while the conversation keeps them.
+  `EventUserTurnStarted`, `EventUserTurnStopped`,
+  `EventUserTurnInferenceTriggered`, `EventUserTurnStopTimeout`,
+  `EventUserTurnIdle`, `EventUserTurnMessageAdded`, `EventUserMuteStarted` and
+  `EventUserMuteStopped`; the assistant half raises `EventAssistantTurnStarted`,
+  `EventAssistantTurnStopped` and `EventAssistantThought`. The assistant half
+  also announces a finished turn to the pipeline as an
+  `LLMContextAssistantTurnFrame`, and stamps each message it writes with an
+  `LLMContextAssistantTimestampFrame`. Both frames were declared but never
+  emitted. The turn-completion markers are stripped from what is reported, while
+  the conversation keeps them.
 
 - **`aggregators.WithMuteStrategies`** configures muting independently of
   `WithTurns`. Muting the user and deciding when their turn ended are different
@@ -1723,12 +1752,12 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   makes it reliable: a barge-in ends one turn and starts the next in the same
   moment.
 
-
 ### Changed
 
 - **`processor.TreatAsPermanent` is now `processor.ForceTreatAsPermanent`**, and
-  the `treatAsPermanent` argument of `PushErrorFrame` is `forceTreatAsPermanent`.
-  The name says that it forces the verdict rather than describing the error.
+  the `treatAsPermanent` argument of `PushErrorFrame` is
+  `forceTreatAsPermanent`. The name says that it forces the verdict rather than
+  describing the error.
 
 - **A processor reads the pipeline's configuration from its setup.** Sample
   rates, the metrics flags and the report-only-initial-TTFB flag are on
@@ -1753,7 +1782,6 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   base previously dialed in a detached goroutine, where a failure reached
   nobody.
 
-
 - **`AudioIdleTimeout` is now a `*time.Duration`** on `vadproc.Config` and
   `audio/vad/controller.Config`. Nil takes the one-second default and a zero
   duration turns the watch off; previously zero took the default and only a
@@ -1773,24 +1801,25 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 - **Four log observers.** `observers.NewDebugLog` renders every exported field
   of the frames going by, with filters that narrow it to a frame type and to one
-  end of a handover, since an unfiltered pipeline pushes dozens of audio frames a
-  second. `NewLLMLog`, `NewTranscriptionLog` and `NewMetricsLog` each report one
-  part of the conversation and need no filter: what a model was asked and
+  end of a handover, since an unfiltered pipeline pushes dozens of audio frames
+  a second. `NewLLMLog`, `NewTranscriptionLog` and `NewMetricsLog` each report
+  one part of the conversation and need no filter: what a model was asked and
   generated, what a transcriber heard, and each measurement as it is reported.
   The first two report only what actually passed through a model or a
   transcriber, so the same frame types travelling elsewhere are left alone.
   `observers.NewLogger` is gone; `NewDebugLog` replaces it.
 
 - **The response latency now says where it went.** `observers.UserBotLatency`
-  reports a `LatencyBreakdown` alongside every latency it measures: the user turn
-  (the detector's silence window, the transcriber finalizing, any end-of-turn
-  analyzer), each service's time to first byte, the sentence aggregation before
-  synthesis, and the tool calls the reply made. `ChronologicalEvents` renders it
-  as a timeline. It also reports `OnFirstBotSpeechLatency`, how long after a
-  client connected the bot first spoke, which is the greeting rather than a
-  reply, and which is abandoned rather than reported when the user speaks first.
-  The latency itself is now measured from the moment the speech ended rather than
-  from the detector confirming it.
+  reports a `LatencyBreakdown` alongside every latency it measures: the user
+  turn (the detector's silence window, the transcriber finalizing, any
+  end-of-turn analyzer), each service's time to first byte, the sentence
+  aggregation before synthesis, and the tool calls the reply made.
+  `ChronologicalEvents` renders it as a timeline. It also reports
+  `OnFirstBotSpeechLatency`, how long after a client connected the bot first
+  spoke, which is the greeting rather than a reply, and which is abandoned
+  rather than reported when the user speaks first. The latency itself is now
+  measured from the moment the speech ended rather than from the detector
+  confirming it.
 
 - **Three processors that had no counterpart.** `aggregators.Sentence` gathers
   streamed text into whole sentences for a consumer that needs them coherent;
@@ -1833,15 +1862,16 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   `processor.ErrorClassifier`. `PushError` takes `WithErrorCategory` and
   `TreatAsPermanent` for a failure the category does not convey.
 
-- **A processor reports whether it can still do its job.** `Usable` is false once
-  its work can no longer succeed, and a permanent category sets it as the error
-  is reported, so a handler reading the error sees the verdict that came with it.
-  `EventUsableChanged` announces the change. Transcription drops the audio it
-  cannot transcribe, releasing what a segmented service had buffered rather than
-  growing it for the rest of the session, and synthesis names the text it leaves
-  unspoken. A settings update that changed something gives the service another
-  chance. A worker applies `ProcessorUnusablePolicy` to the first error that says
-  a processor is finished: continue (the default), end, or cancel.
+- **A processor reports whether it can still do its job.** `Usable` is false
+  once its work can no longer succeed, and a permanent category sets it as the
+  error is reported, so a handler reading the error sees the verdict that came
+  with it. `EventUsableChanged` announces the change. Transcription drops the
+  audio it cannot transcribe, releasing what a segmented service had buffered
+  rather than growing it for the rest of the session, and synthesis names the
+  text it leaves unspoken. A settings update that changed something gives the
+  service another chance. A worker applies `ProcessorUnusablePolicy` to the
+  first error that says a processor is finished: continue (the default), end, or
+  cancel.
 
 - **A tool can say the model may cancel its calls.**
   `llm.WithCancellableByLLM(true)` advertises the tool alongside its own
@@ -1892,14 +1922,14 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 - **A tool call its handler could not finish is settled.** A handler that
   returned an error left its call in progress, so the aggregator waited on a
-  result that could never arrive and the assistant turn never completed. The call
-  is now settled on the handler's behalf with a result naming the function, and
-  the failure is reported as the application's own rather than counting against
-  the service.
+  result that could never arrive and the assistant turn never completed. The
+  call is now settled on the handler's behalf with a result naming the function,
+  and the failure is reported as the application's own rather than counting
+  against the service.
 
 - **A function call that overruns its deadline is cancelled rather than
-  abandoned.** It reported an empty result and left its handler running. The call
-  is now settled first, so a result racing in while the handler unwinds is
+  abandoned.** It reported an empty result and left its handler running. The
+  call is now settled first, so a result racing in while the handler unwinds is
   rejected, then the handler's context is cancelled so it can roll back what it
   started, and the cancellation asks for inference so the model can say the call
   did not complete. An interruption still does not ask, and neither does a
@@ -1907,22 +1937,22 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   conversation whether or not the model was waiting on it.
 
 - **Failover switches only from a service that can no longer work.** It switched
-  on every error the active service reported, so a single 500 walked the switcher
-  through its whole fallback chain and nothing stopped it making a permanently
-  broken service active. It now reads the verdict off the error, walks past
-  candidates that cannot work, and refuses a manual switch to one of those. An
-  error from a service held in reserve stops at the switcher; one it recovered
-  from by switching goes no further; one that leaves the active service finished
-  with nowhere to move the work is reported against the switcher, uncategorized,
-  so the pipeline judges it by what it has left.
+  on every error the active service reported, so a single 500 walked the
+  switcher through its whole fallback chain and nothing stopped it making a
+  permanently broken service active. It now reads the verdict off the error,
+  walks past candidates that cannot work, and refuses a manual switch to one of
+  those. An error from a service held in reserve stops at the switcher; one it
+  recovered from by switching goes no further; one that leaves the active
+  service finished with nowhere to move the work is reported against the
+  switcher, uncategorized, so the pipeline judges it by what it has left.
 
 - **A run whose context ends always reports the pipeline finished.** The run
   loop is what drains the worker's queue, so a cancellation asked for as the run
   was ending left its `CancelFrame` stranded there: the pipeline was never told
   the run was over, and neither was anything watching the worker. That frame now
-  goes straight into the pipeline, carrying the reason the cancellation was asked
-  for, and a run that already sent one waits it out rather than sending a second.
-  `on_pipeline_finished` is raised once however the run ends.
+  goes straight into the pipeline, carrying the reason the cancellation was
+  asked for, and a run that already sent one waits it out rather than sending a
+  second. `on_pipeline_finished` is raised once however the run ends.
 
 - **A websocket service stops redialing a provider that keeps refusing.** It
   reported a lost connection as a bare message and guessed locally at when to
@@ -1931,8 +1961,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   first one is reported, and a service already unable to work is not redialed at
   all.
 
-- **Mistral STT transcribes a turn when it ends.** The realtime session closes
-  a segment only when the client flushes the audio it has sent, and nothing ever
+- **Mistral STT transcribes a turn when it ends.** The realtime session closes a
+  segment only when the client flushes the audio it has sent, and nothing ever
   flushed it, so a pipeline saw the sentence growing as interim transcriptions
   and never received the transcription that closes the turn. The session is now
   flushed as soon as the VAD reports the speech ended, and the transcript that
@@ -1945,10 +1975,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - **An LLM service generates summaries on its own inference.** The base handed
   the processor its own address as self, so nothing could reach a service's
   `RunInference` through it and every in-pipeline summarization request failed
-  with "the LLM service does not run inference" without the model being asked.
-  A generation that runs out of time is now also told apart from one that
-  failed: both are reported to the pipeline, but only a failure is carried on
-  the result.
+  with "the LLM service does not run inference" without the model being asked. A
+  generation that runs out of time is now also told apart from one that failed:
+  both are reported to the pipeline, but only a failure is carried on the
+  result.
 
 ### Changed
 
@@ -2006,27 +2036,27 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   `processor/dtmf` keeps the aggregator.
 
 - **`observers.StartupTiming` measures what starting the pipeline cost.** It
-  timed the pipeline start to the first bot audio, which conflates the cold start
-  with the whole first turn. It now times each processor's own start, the gap
-  between it being handed the `StartFrame` and passing it on, which is where a
-  service connects, authenticates and loads its models, and reports the lot once
-  the pipeline is up. `OnTransportTimingReport` reports the other half: how long
-  the bot took to join the session, and how long until the first client did.
-  `StartupConfig` is now `StartupTimingConfig`.
+  timed the pipeline start to the first bot audio, which conflates the cold
+  start with the whole first turn. It now times each processor's own start, the
+  gap between it being handed the `StartFrame` and passing it on, which is where
+  a service connects, authenticates and loads its models, and reports the lot
+  once the pipeline is up. `OnTransportTimingReport` reports the other half: how
+  long the bot took to join the session, and how long until the first client
+  did. `StartupConfig` is now `StartupTimingConfig`.
 
 - **A turn is timed on the pipeline clock.** `observers.TurnTracking` measured
   turns against the wall clock at the moment it was told about a frame. It now
-  measures between the frames themselves, so a turn ended by the turn-end timeout
-  is measured to the moment the bot fell silent rather than to the moment the
-  timer fired: the wait exists to tell a pause apart from an ending, and it is
-  not part of the turn.
+  measures between the frames themselves, so a turn ended by the turn-end
+  timeout is measured to the moment the bot fell silent rather than to the
+  moment the timer fired: the wait exists to tell a pause apart from an ending,
+  and it is not part of the turn.
 
-- **`llm.WithAsyncToolCancellation` is deprecated.** It offered one built-in tool
-  that could stop any pending call, so a model that wrongly decided a result was
-  unwanted could destroy work nobody asked it to abandon. Register the tools the
-  model may cancel with `WithCancellableByLLM(true)` instead; meanwhile the
-  option widens cancellation to every asynchronous tool, which is the unbounded
-  shape it replaces.
+- **`llm.WithAsyncToolCancellation` is deprecated.** It offered one built-in
+  tool that could stop any pending call, so a model that wrongly decided a
+  result was unwanted could destroy work nobody asked it to abandon. Register
+  the tools the model may cancel with `WithCancellableByLLM(true)` instead;
+  meanwhile the option widens cancellation to every asynchronous tool, which is
+  the unbounded shape it replaces.
 
 - **`PushError` takes options, and error reporting goes through
   `PushErrorFrame`.** A processor overriding the error path implements
@@ -2044,12 +2074,12 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   which left a worker running with handlers its author had not written. The
   second would never run, so it is refused where it is declared instead.
 
-- **`pipeline.Task` is now `pipeline.Worker`, and it is a worker.** A pipeline is
-  one participant in a session rather than the whole of it, so the thing driving
-  it is addressed by name, becomes ready when its pipeline is up, is activated
-  and deactivated over the bus, and can exchange long-running jobs with other
-  workers. `NewTask` is `NewWorker`, and its configuration splits: the values
-  that ride on the `StartFrame` and reach every processor are
+- **`pipeline.Task` is now `pipeline.Worker`, and it is a worker.** A pipeline
+  is one participant in a session rather than the whole of it, so the thing
+  driving it is addressed by name, becomes ready when its pipeline is up, is
+  activated and deactivated over the bus, and can exchange long-running jobs
+  with other workers. `NewTask` is `NewWorker`, and its configuration splits:
+  the values that ride on the `StartFrame` and reach every processor are
   `pipeline.Params`, and the rest is `pipeline.WorkerConfig`, which carries them
   as its `Params` field. There is no alias; every call site changes.
 
@@ -2062,9 +2092,9 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   other, and something built after the worker can still attach to it. Handlers
   run off the frame path, in the order the worker raised them.
 
-- **RTVI is on by default.** A worker puts an `rtvi.Processor` at the head of its
-  pipeline and its observer alongside the others, so a client is told what the
-  session is doing without the pipeline being built for it. A pipeline that
+- **RTVI is on by default.** A worker puts an `rtvi.Processor` at the head of
+  its pipeline and its observer alongside the others, so a client is told what
+  the session is doing without the pipeline being built for it. A pipeline that
   already contains one keeps it. Set `EnableRTVI` false for a pipeline with no
   client on the other end. Examples no longer wire it by hand.
 
@@ -2074,12 +2104,13 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   session down with it.
 
 - **`pipeline.Runner` is gone; use `workers.Runner`.** Running one pipeline and
-  running a session of workers were the same job done twice, and only the
-  worker runner knows about the bus, the registry and the other workers. It
-  cancels on `SIGINT` by default, where the old runner also took `SIGTERM`; ask
-  for that with `HandleTerminate`.
+  running a session of workers were the same job done twice, and only the worker
+  runner knows about the bus, the registry and the other workers. It cancels on
+  `SIGINT` by default, where the old runner also took `SIGTERM`; ask for that
+  with `HandleTerminate`.
 
-- **`flows.Watcher` watches through the event registry.** It takes `Events()
+- **`flows.Watcher` watches through the event registry.** It takes
+  `Events()
   *events.Registry` in place of `OnReachedDownstream(fn)`.
 
 - **Watching stops when the pipeline does.** A task used to hand over everything
@@ -2202,10 +2233,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   `user-audio-level` and `bot-audio-level`, the loudness of the user's input and
   the bot's synthesized speech on a 0..1 scale, for a client drawing a speaking
   meter. Both are off by default (`UserAudioLevelEnabled`,
-  `BotAudioLevelEnabled`) since they are a message every `AudioLevelPeriod`
-  (150 ms by default) for as long as the call lasts. The level is measured over
-  a rolling 400 ms window rather than per frame, so it reads 0 until enough
-  audio has arrived to measure.
+  `BotAudioLevelEnabled`) since they are a message every `AudioLevelPeriod` (150
+  ms by default) for as long as the call lasts. The level is measured over a
+  rolling 400 ms window rather than per frame, so it reads 0 until enough audio
+  has arrived to measure.
 
 - **Two text aggregators that read structure in what the model writes.**
   `text.SkipTagsAggregator` never looks for a sentence boundary between a pair
@@ -2218,10 +2249,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   scanning they share.
 
 - **Processors for wiring a pipeline to itself.** `processor.ProducerProcessor`
-  picks frames out of the stream passing through it and hands them to any
-  number of `processor.ConsumerProcessor`s elsewhere, so a frame can reach a
-  part of the pipeline it does not flow through. `processor.IdleFrameProcessor`
-  calls back when the frames it watches for stop arriving.
+  picks frames out of the stream passing through it and hands them to any number
+  of `processor.ConsumerProcessor`s elsewhere, so a frame can reach a part of
+  the pipeline it does not flow through. `processor.IdleFrameProcessor` calls
+  back when the frames it watches for stop arriving.
   `processor.StatelessTextTransformer` rewrites the text of every text frame.
 
 - **Three more filters, and the notifier they signal.** `processor.FrameFilter`
@@ -2256,42 +2287,42 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   it.
 
 - **Rime speaks to the model it is actually using.** Four things had drifted
-  from the provider. The default model was `arcana`, where Rime's current one
-  is `coda`. The language was sent as `en`, where Rime names languages with
-  three letters (`eng`, `fra`, `ger`, `spa`, `hin`) and takes nothing else, so
-  the default request named a language that does not exist. The voice defaulted
-  to `astra` rather than letting Rime pick, pinning a voice that need not suit
-  the model. And every model control was sent whatever the model, where coda
-  takes the sampling controls (`repetition_penalty`, `temperature`, `top_p`,
+  from the provider. The default model was `arcana`, where Rime's current one is
+  `coda`. The language was sent as `en`, where Rime names languages with three
+  letters (`eng`, `fra`, `ger`, `spa`, `hin`) and takes nothing else, so the
+  default request named a language that does not exist. The voice defaulted to
+  `astra` rather than letting Rime pick, pinning a voice that need not suit the
+  model. And every model control was sent whatever the model, where coda takes
+  the sampling controls (`repetition_penalty`, `temperature`, `top_p`,
   `timeScaleFactor`) and the older mist models take the bracket and latency
   ones, each rejecting the other's. The controls now follow the model, and an
   unset voice goes as null, which is how Rime is asked to choose. A caller who
   named a model, a voice or a language explicitly is unaffected.
 
-- **Six transcription services report the model they are using.** Groq,
-  Mistral, OpenAI, Sarvam, Smallest and Together each take a model and each
-  left it out of the metadata the service reads, so their spans and metrics
-  carried an empty `gen_ai.request.model` and their usage was priced against
-  nothing. They now report it, as the other transcription services already did.
+- **Six transcription services report the model they are using.** Groq, Mistral,
+  OpenAI, Sarvam, Smallest and Together each take a model and each left it out
+  of the metadata the service reads, so their spans and metrics carried an empty
+  `gen_ai.request.model` and their usage was priced against nothing. They now
+  report it, as the other transcription services already did.
 
 - **Turn detection resamples through a filter.** A turn stream at a rate other
-  than the model's 16 kHz was converted by linear interpolation, with nothing
-  to band-limit it first, so everything above the new Nyquist folded back down
-  into the band below. A 12 kHz tone in a 48 kHz stream came out at 4 kHz and
-  full amplitude, in the middle of the speech the model reads its features
-  from. The conversion now goes through the pipeline's own converter, a sinc
-  polyphase filter (libsoxr under the `libsoxr` tag), which leaves that tone
-  about 51 dB down. Pipelines feeding the analyzer 16 kHz, which is the usual
-  arrangement, are unaffected.
+  than the model's 16 kHz was converted by linear interpolation, with nothing to
+  band-limit it first, so everything above the new Nyquist folded back down into
+  the band below. A 12 kHz tone in a 48 kHz stream came out at 4 kHz and full
+  amplitude, in the middle of the speech the model reads its features from. The
+  conversion now goes through the pipeline's own converter, a sinc polyphase
+  filter (libsoxr under the `libsoxr` tag), which leaves that tone about 51 dB
+  down. Pipelines feeding the analyzer 16 kHz, which is the usual arrangement,
+  are unaffected.
 
 - **Voice detection measures loudness over a gating block again.** The minimum
   volume a frame had to reach before it counted as speech was measured on that
   frame alone, about 32 ms of audio. Loudness is defined over a BS.1770 gating
   block of 400 ms, so a fraction of one is not a reading at all, and the gate
-  was deciding on a figure that did not mean what it was compared against.
-  Audio now accumulates into a rolling 400 ms window (`loudness.Tracker`), which
-  is what the gate measures; the window reads zero until it holds a full block.
-  A parameter change also no longer discards the audio buffered behind it: the
+  was deciding on a figure that did not mean what it was compared against. Audio
+  now accumulates into a rolling 400 ms window (`loudness.Tracker`), which is
+  what the gate measures; the window reads zero until it holds a full block. A
+  parameter change also no longer discards the audio buffered behind it: the
   decision restarts, the stream does not.
 
 - **Filtering code blocks out of speech works again.** The Markdown filter's
@@ -2371,13 +2402,13 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 - **A pipeline can be watched without being slowed down.** Observers were called
   on the goroutine carrying the frame, once per handover, so a slow one changed
-  how the pipeline ran. Each observer now has a queue and a goroutine of its own.
-  `Task.AddObserver` registers one while the pipeline runs.
+  how the pipeline ran. Each observer now has a queue and a goroutine of its
+  own. `Task.AddObserver` registers one while the pipeline runs.
 
 - **Heartbeats tell a quiet pipeline from a stuck one.**
-  `Params.EnableHeartbeats` sends a frame through at a fixed interval and
-  calls `OnHeartbeatTimeout` when none reaches the far end, repeating for as long
-  as the silence lasts.
+  `Params.EnableHeartbeats` sends a frame through at a fixed interval and calls
+  `OnHeartbeatTimeout` when none reaches the far end, repeating for as long as
+  the silence lasts.
 
 - **An idle pipeline is canceled.** `WorkerConfig.IdleTimeout` (five minutes by
   default) watches for the conversation going quiet. `IdleTimeoutFrames` chooses
@@ -2413,20 +2444,21 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 ### Changed
 
 - **Switching services is chosen by a strategy.** `pipeline.NewServiceSwitcher`
-  takes `pipeline.NewManualStrategy` or `pipeline.NewFailoverStrategy` instead of
-  the `SwitchManual` and `SwitchFailover` constants, or any
+  takes `pipeline.NewManualStrategy` or `pipeline.NewFailoverStrategy` instead
+  of the `SwitchManual` and `SwitchFailover` constants, or any
   `pipeline.SwitcherStrategy`. `pipeline.SwitchServiceFrame` is now
   `frames.ManuallySwitchServiceFrame`.
 
 - **The reached handlers report what their filter selects.** They used to fire
-  for every frame; an unset filter now selects nothing, so a handler says what it
-  wants to hear about. `pipeline.AnyFrame` restores the old behavior.
+  for every frame; an unset filter now selects nothing, so a handler says what
+  it wants to hear about. `pipeline.AnyFrame` restores the old behavior.
 
 - **Turning turn tracking off turns tracing off with it.** The turn spans are
   what the trace is made of.
 
 - **The STT, TTS and LLM bases embed `*service.Base`.** A service built directly
-  on `processor.Base` no longer describes itself and should embed `service.Base`.
+  on `processor.Base` no longer describes itself and should embed
+  `service.Base`.
 
 - **`flows.Enqueuer` and `frames.SettingsUpdate` gained methods.** The optional
   direction on `QueueFrame` and `QueueFrames`, and `Copy` on a settings update.
@@ -2436,9 +2468,9 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   that is not part of the conversation — a processor acting on something the
   model was never consulted about. It applies the node the way entering one
   always does and, unless the node waits for the user, asks the assistant to
-  respond from it. The flow has to have been entered with `Initialize` first.
-  A node function still transitions by returning the next node, which keeps
-  that move on the tool loop that made it.
+  respond from it. The flow has to have been entered with `Initialize` first. A
+  node function still transitions by returning the next node, which keeps that
+  move on the tool loop that made it.
 
 - **A client can ask for a reply it is not read aloud.** `audio_response: false`
   on an RTVI send-text is now honored: the turn is answered and added to the
@@ -2480,27 +2512,27 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   accept. The summarizer and the eval judge run through it rather than through a
   streamed generation, which is what lets the judge bound its own verdict.
 
-- **A completion timeout is reported as one.** `OnCompletionTimeout` fires when a
-  generation gives up waiting for the provider, and the error frame says so,
+- **A completion timeout is reported as one.** `OnCompletionTimeout` fires when
+  a generation gives up waiting for the provider, and the error frame says so,
   which is the signal to fail over on rather than an error like any other.
   Anthropic, Gemini, the Responses services and the chat-completions one all
   report theirs through it, and a turn cut short by an interruption is not
   mistaken for one: the pipeline's own doing is not the provider running out of
-  time. The
-  chat service can be built to retry a request that has not started in time
-  (`RetryOnTimeout`, `RetryTimeout`); the retry is unbounded, so a slow answer is
-  never cut off part way. `ServiceTier` selects the tier an endpoint serves the
-  request under.
+  time. The chat service can be built to retry a request that has not started in
+  time (`RetryOnTimeout`, `RetryTimeout`); the retry is unbounded, so a slow
+  answer is never cut off part way. `ServiceTier` selects the tier an endpoint
+  serves the request under.
 
 - **A bot can send DTMF keypresses.** `OutputDTMFFrame` and the new
-  `OutputDTMFUrgentFrame` were defined but nothing ever played them, so there was
-  no way to answer an IVR. The output transport now sounds each key as the tone
-  pair that names it on the keypad, queued behind the audio already playing so
-  the keys land where the caller meant them; the urgent frame goes out at once,
-  for a key answering a prompt that is still playing. A transport whose protocol
-  carries keypresses reports `SupportsNativeDTMF` and is handed them instead, so
-  the tones stay out of the audio. Both frames now carry a run of keys rather
-  than one, since a caller entering an account number presses several.
+  `OutputDTMFUrgentFrame` were defined but nothing ever played them, so there
+  was no way to answer an IVR. The output transport now sounds each key as the
+  tone pair that names it on the keypad, queued behind the audio already playing
+  so the keys land where the caller meant them; the urgent frame goes out at
+  once, for a key answering a prompt that is still playing. A transport whose
+  protocol carries keypresses reports `SupportsNativeDTMF` and is handed them
+  instead, so the tones stay out of the audio. Both frames now carry a run of
+  keys rather than one, since a caller entering an account number presses
+  several.
 
 - **A scenario can press keypad keys, start from a context, observe without
   speaking, and share blocks between files.** `dtmf: "123#"` on a turn sends the
@@ -2519,11 +2551,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   makes them useful as a timing anchor. Off by default in the RTVI observer, and
   the harness asks for them only when a scenario references one.
 
-- **A run reports how it went, not just whether it passed.** `Result` carries the
-  duration, every event the bot emitted in order, and a timestamped trace of the
-  harness's own decisions; `Options.OnProgress` reports the same as it happens.
-  A scenario that fails once and passes the next time is readable from the trace
-  rather than by re-running it.
+- **A run reports how it went, not just whether it passed.** `Result` carries
+  the duration, every event the bot emitted in order, and a timestamped trace of
+  the harness's own decisions; `Options.OnProgress` reports the same as it
+  happens. A scenario that fails once and passes the next time is readable from
+  the trace rather than by re-running it.
 
 - **A scenario can assert on what reached synthesis.** The `tts_response` event
   carries the text the bot's TTS reports speaking, one segment as each arrives,
@@ -2557,14 +2589,15 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   side.
 
 - **A tool the LLM service implements itself lives on its adapter, not on the
-  conversation.** `LLMContext.SetServiceTools`, `LLMContext.SetServiceInstructions`
-  and `LLMContext.AppTools` are gone, and `LLMContext.Tools` returns exactly what
-  the application advertised. The built-in async-cancellation tool was written
-  into the shared conversation, which edited a context the application owns and
-  offered the tool to every other service reading that conversation. It now sits
-  on the adapter the service converts through, which renders it in that
-  provider's own format. A service that wants to offer one implements
-  `llm.AdapterHolder`; every jargo LLM service does.
+  conversation.** `LLMContext.SetServiceTools`,
+  `LLMContext.SetServiceInstructions` and `LLMContext.AppTools` are gone, and
+  `LLMContext.Tools` returns exactly what the application advertised. The
+  built-in async-cancellation tool was written into the shared conversation,
+  which edited a context the application owns and offered the tool to every
+  other service reading that conversation. It now sits on the adapter the
+  service converts through, which renders it in that provider's own format. A
+  service that wants to offer one implements `llm.AdapterHolder`; every jargo
+  LLM service does.
 
 - **An OpenAI-compatible endpoint states its adapter rather than a message
   hook.** `chat.Compat.ShapeMessages` is gone; `chat.Compat.Adapter` takes an
@@ -2578,8 +2611,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 - **A summarizer and a judge are built on a service that answers once, not on a
   streaming generator.** `llm.NewSummarizer` and `eval.NewLLMJudge` take an
-  `llm.Inferencer`. Every jargo LLM service satisfies it, so a caller passing one
-  is unaffected.
+  `llm.Inferencer`. Every jargo LLM service satisfies it, so a caller passing
+  one is unaffected.
 
 - **A Gemini request shaper addresses both forms of the method.**
   `gemini.RequestShaper.Endpoint` takes whether the streaming form is wanted,
@@ -2602,13 +2635,13 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   service switcher decides the rest of the system frames.** The filter dropped
   whatever its predicate rejected, lifecycle and system frames included, so a
   branch gated off by one would never have been started or shut down. Those pass
-  now whatever the predicate says. Every other system frame passes as well unless
-  the filter is built to decide them, which the service switcher now asks for: a
-  branch that is gated off stops following the conversation rather than hearing
-  all of it in the background. The direction a filter gates is optional, and one
-  built without a direction decides both. The predicate is consulted for every
-  frame, including those that pass regardless, so a predicate watching the stream
-  sees all of it.
+  now whatever the predicate says. Every other system frame passes as well
+  unless the filter is built to decide them, which the service switcher now asks
+  for: a branch that is gated off stops following the conversation rather than
+  hearing all of it in the background. The direction a filter gates is optional,
+  and one built without a direction decides both. The predicate is consulted for
+  every frame, including those that pass regardless, so a predicate watching the
+  stream sees all of it.
 
 - **Deepgram takes a base URL, and derives its endpoints from it.** The STT
   service's `ListenURL` is replaced by `BaseURL`, and the Aura TTS service gains
@@ -2682,16 +2715,16 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   late system message, merges each run of same-role messages into one carrying
   both contents, and drops a trailing assistant message (which is what OpenAI
   does with one server-side, so the turn reads the same either way). A trailing
-  system message is deliberately left alone: demoting it would depend on how much
-  of the conversation had happened so far, and Perplexity rejects a message whose
-  role changes between turns.
+  system message is deliberately left alone: demoting it would depend on how
+  much of the conversation had happened so far, and Perplexity rejects a message
+  whose role changes between turns.
 
 - **`bot-tts-text` reports what the TTS spoke, not what it was asked to speak.**
-  The RTVI processor built the message from `TTSSpeakFrame`, which is text on its
-  way into the service: a client rendered it as spoken caption before synthesis
-  had happened, and nothing was sent for a reply the LLM produced, which is the
-  ordinary path. It is built from `TTSTextFrame` now, the text the service
-  reports speaking, aligned to playback.
+  The RTVI processor built the message from `TTSSpeakFrame`, which is text on
+  its way into the service: a client rendered it as spoken caption before
+  synthesis had happened, and nothing was sent for a reply the LLM produced,
+  which is the ordinary path. It is built from `TTSTextFrame` now, the text the
+  service reports speaking, aligned to playback.
 
 - **Every OpenAI-compatible provider reports its token usage.** The
   chat-completions service never asked for the counts and never reported any, so
@@ -2703,8 +2736,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   answered, which is more specific than the one asked for.
 
 - **The conversation's tool choice is sent.** `LLMContext.SetToolChoice` was
-  honored by the realtime services and dropped by every OpenAI-compatible one, so
-  a conversation that required a tool call was sent as though it did not.
+  honored by the realtime services and dropped by every OpenAI-compatible one,
+  so a conversation that required a tool call was sent as though it did not.
 
 - **A tool call whose arguments are not valid JSON is dropped.** The raw text
   reached the handler, which failed on it, and the model read that as the tool
@@ -2727,9 +2760,9 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - **Mistral is sent a conversation it accepts.** Beyond the OpenAI schema it
   requires a tool result to be followed by an assistant message, accepts system
   messages only in the opening block, and continues a trailing assistant message
-  only when it is marked as a prefix. None of that was applied, so a tool-calling
-  turn could be rejected outright. The seed is also sent under the name Mistral
-  reads it by.
+  only when it is marked as a prefix. None of that was applied, so a
+  tool-calling turn could be rejected outright. The seed is also sent under the
+  name Mistral reads it by.
 
 - **Twelve OpenAI-compatible endpoints stop being sent a role they reject.**
   Cerebras, DeepSeek, Inception, Mistral, Nebius, Ollama, OpenRouter,
@@ -2738,10 +2771,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   now go to them as user messages, so what the tool reported reaches the model
   instead of failing the turn.
 
-- **The built-in async-cancellation tool is no longer announced as a tool call.**
-  It is how the model abandons an asynchronous call, an internal mechanism, but
-  it was reported through `OnFunctionCallsStarted` and `FunctionCallsStartedFrame`
-  alongside the application's own tools. It still runs; it is no longer reported.
+- **The built-in async-cancellation tool is no longer announced as a tool
+  call.** It is how the model abandons an asynchronous call, an internal
+  mechanism, but it was reported through `OnFunctionCallsStarted` and
+  `FunctionCallsStartedFrame` alongside the application's own tools. It still
+  runs; it is no longer reported.
 
 - **A resume reaches the pipeline before the frames it releases.** A processor
   paused by a frame addressed to it was released the moment that frame was
@@ -2752,29 +2786,29 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   the frame carrying it has gone on.
 
 - **ElevenLabs carries a turn's text into its next sentence, and times the words
-  it speaks over HTTP.** The HTTP service synthesized every sentence as though it
-  were the first: nothing told the model what had already been said, so the
+  it speaks over HTTP.** The HTTP service synthesized every sentence as though
+  it were the first: nothing told the model what had already been said, so the
   prosody restarted at each sentence boundary. It now sends what has been spoken
   so far in the turn as context, drops it when the turn ends, is interrupted, or
   the pipeline starts, and leaves it off the models that reject it. The service
   also asks for timestamps and reports word timing, so the conversation records
-  what was actually spoken before an interruption rather than the whole sentence,
-  and a language code now reaches only the models that accept one. Both the HTTP
-  and the WebSocket paths strip an utterance's leading spaces and no others,
-  keeping the space that separates a word split across two chunks.
+  what was actually spoken before an interruption rather than the whole
+  sentence, and a language code now reaches only the models that accept one.
+  Both the HTTP and the WebSocket paths strip an utterance's leading spaces and
+  no others, keeping the space that separates a word split across two chunks.
 
 - **Cartesia and ElevenLabs normalize their own word timings, and say when their
   tokens carry their own spacing.** Both asked the TTS base to merge punctuation
-  into the preceding word, which is not what either needs: assembling ElevenLabs'
-  characters on spaces already attaches each word's punctuation to it, and
-  Cartesia reports whole words. The merging changed what a locale spacing its
-  punctuation produces, turning "va" and "?" into "va?" and leaving the tracker
-  matching against text that reads otherwise. Cartesia now strips the markup it
-  was given back out of the tokens it reports, drops what was only markup or
-  spacing, and joins a message of Chinese or Japanese characters into the one
-  token a reader of the language recognizes. Both providers now report whether
-  their language is written without spaces between words, so a turn in one is
-  assembled with no spacing added.
+  into the preceding word, which is not what either needs: assembling
+  ElevenLabs' characters on spaces already attaches each word's punctuation to
+  it, and Cartesia reports whole words. The merging changed what a locale
+  spacing its punctuation produces, turning "va" and "?" into "va?" and leaving
+  the tracker matching against text that reads otherwise. Cartesia now strips
+  the markup it was given back out of the tokens it reports, drops what was only
+  markup or spacing, and joins a message of Chinese or Japanese characters into
+  the one token a reader of the language recognizes. Both providers now report
+  whether their language is written without spaces between words, so a turn in
+  one is assembled with no spacing added.
 
 - **The recorder can hand over each turn's audio on its own.** Set
   `EnableTurnAudio` and the user's audio arrives through `OnUserTurnAudioData`
@@ -2803,47 +2837,48 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 - **A provider can report tokens that carry their own spacing.** A language
   written without spaces between words, Chinese or Japanese, has its timings
-  reported per character or per segment, so the tokens already read as continuous
-  text. There was no way to say so: every timed token was emitted saying it
-  carried no spacing, and consumers joining them put a space between characters
-  belonging to one word, which is how a Japanese turn reached the conversation as
-  "こんにちは、私は... AIアシスタントです。". `WordTimingOptions` now carries
-  `IncludesInterFrameSpaces`, threaded to the text frames the words produce, and
-  the Soniox provider sets it for the languages it already detects as spaceless.
+  reported per character or per segment, so the tokens already read as
+  continuous text. There was no way to say so: every timed token was emitted
+  saying it carried no spacing, and consumers joining them put a space between
+  characters belonging to one word, which is how a Japanese turn reached the
+  conversation as "こんにちは、私は... AIアシスタントです。".
+  `WordTimingOptions` now carries `IncludesInterFrameSpaces`, threaded to the
+  text frames the words produce, and the Soniox provider sets it for the
+  languages it already detects as spaceless.
 
 - **The end of a model response now lands behind the words it ends.** Where the
   provider times its words, those words carry the moment they are spoken and
-  travel the transport's queue for timed frames, which holds each until then. The
-  frame ending the response carried no timing, so it took the other queue and
-  could overtake the tail of the very response it closed: anything keying off it,
-  a turn observer or a client's bot-stopped event, saw the response end while its
-  last words were still being said. It is now held until the audio for that turn
-  has been heard and stamped with the last word's moment. The frame held is the
-  frame pushed, id and all, so a consumer recognizing one it has already seen is
-  not told twice that the same response ended.
+  travel the transport's queue for timed frames, which holds each until then.
+  The frame ending the response carried no timing, so it took the other queue
+  and could overtake the tail of the very response it closed: anything keying
+  off it, a turn observer or a client's bot-stopped event, saw the response end
+  while its last words were still being said. It is now held until the audio for
+  that turn has been heard and stamped with the last word's moment. The frame
+  held is the frame pushed, id and all, so a consumer recognizing one it has
+  already seen is not told twice that the same response ended.
 
 - **An utterance the service speaks is recorded as one assistant message, closed
   where it ends.** The assistant aggregator wrote spoken text into the
   conversation word by word, rewriting the message in place as each one arrived,
   and had no way to close a turn that no model response surrounded. It now
-  gathers what the turn said and writes it once: the start of speech that will be
-  recorded opens the turn, the words fill it, and the end of the speech closes
-  it. A fixed utterance therefore lands as a message of its own rather than
-  merged into whatever the model says next, and an interruption still records
-  exactly the words that were heard, since only those have arrived by then. The
-  pieces are joined by whether each carries its own spacing, so a model's
-  streamed text and a synthesizer's word-by-word report can make up one turn
-  without doubled or missing spaces. A unit held back from the synthesizer, a
-  code block, reaches the conversation this way too, where before it was dropped
-  from it entirely.
+  gathers what the turn said and writes it once: the start of speech that will
+  be recorded opens the turn, the words fill it, and the end of the speech
+  closes it. A fixed utterance therefore lands as a message of its own rather
+  than merged into whatever the model says next, and an interruption still
+  records exactly the words that were heard, since only those have arrived by
+  then. The pieces are joined by whether each carries its own spacing, so a
+  model's streamed text and a synthesizer's word-by-word report can make up one
+  turn without doubled or missing spaces. A unit held back from the synthesizer,
+  a code block, reaches the conversation this way too, where before it was
+  dropped from it entirely.
 
 - **The user's transcripts and a fixed utterance's request no longer travel past
   the processor that consumes them.** A transcript stops at the user aggregator
   and a `TTSSpeakFrame` stops at the TTS service. What reaches the model is the
   conversation, not the frames it was built from. A client is told about both by
   the RTVI observer, which watches each where it is pushed rather than waiting
-  for it to travel further, so nothing is lost by keeping them out of the rest of
-  the pipeline.
+  for it to travel further, so nothing is lost by keeping them out of the rest
+  of the pipeline.
 
 - **`TTSStartedFrame` and `TTSStoppedFrame` name the context they belong to.**
   Both fields were declared, documented and never set, so a consumer could not
@@ -2855,32 +2890,32 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   processor, so a call that dropped just after the user spoke left the
   conversation ending on the bot's turn with no record that they answered.
 
-- **A transcript arriving outside a turn is no longer answered on its own.** With
-  turn taking, the user aggregator committed the aggregation whenever it held
-  text and end-of-turn had been reported, and the flag saying so was left set
-  whenever a turn ended with nothing new to commit. A stop strategy signals
+- **A transcript arriving outside a turn is no longer answered on its own.**
+  With turn taking, the user aggregator committed the aggregation whenever it
+  held text and end-of-turn had been reported, and the flag saying so was left
+  set whenever a turn ended with nothing new to commit. A stop strategy signals
   inference first and finalization second, so an ordinary turn commits on the
   first and leaves the flag set on the second: from then on the next transcript,
-  whenever it landed, became a user message and ran the model with no turn behind
-  it. A streaming STT delivering one utterance as two final transcripts therefore
-  had its tail answered separately, so the conversation held half a sentence as
-  its own user message and the turn was answered twice. Where it called a tool,
-  the tool ran twice. The turn controller is now the only thing that commits: a
-  transcript adds to the aggregation and nothing else, and a tail arriving after
-  a turn closed joins the next turn rather than opening a second answer to the
-  one that just ended.
+  whenever it landed, became a user message and ran the model with no turn
+  behind it. A streaming STT delivering one utterance as two final transcripts
+  therefore had its tail answered separately, so the conversation held half a
+  sentence as its own user message and the turn was answered twice. Where it
+  called a tool, the tool ran twice. The turn controller is now the only thing
+  that commits: a transcript adds to the aggregation and nothing else, and a
+  tail arriving after a turn closed joins the next turn rather than opening a
+  second answer to the one that just ended.
 
 - **`TTSSpeakFrame.AppendToContext` is honoured.** A fixed utterance queued with
-  the flag set to `false` still reached the conversation as an assistant message.
-  The service cleared the flag on the frame, which is what stops the text being
-  recorded twice, but the caller's answer went no further: the frames that
-  actually build the conversation were emitted saying `true` whatever was asked
-  for. It is now carried on the context the utterance is spoken on and stamped
-  onto every frame emitted from it, on both paths, the per-word frames a provider
-  that times its words produces and the whole unit emitted for one that does not.
-  The flag exists for text the service says rather than the assistant, a phrase
-  covering a tool call or a stall while something is fetched, and recording those
-  tells the model it said things it never composed.
+  the flag set to `false` still reached the conversation as an assistant
+  message. The service cleared the flag on the frame, which is what stops the
+  text being recorded twice, but the caller's answer went no further: the frames
+  that actually build the conversation were emitted saying `true` whatever was
+  asked for. It is now carried on the context the utterance is spoken on and
+  stamped onto every frame emitted from it, on both paths, the per-word frames a
+  provider that times its words produces and the whole unit emitted for one that
+  does not. The flag exists for text the service says rather than the assistant,
+  a phrase covering a tool call or a stall while something is fetched, and
+  recording those tells the model it said things it never composed.
 
 - **A `send-text` that runs immediately now cuts the bot off, and waits for the
   pipeline to settle before appending.** It used to append the new user message
@@ -2940,9 +2975,9 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   first segment.** A turn often answers in more than one response: an interim
   filler ("Let me check on that.") and then the answer. Checking the first one
   failed the assertion on the filler. A `text_contains` or `judge:` on
-  `llm_response` now accumulates successive segments and re-checks on each, until
-  the check passes, the judge rejects, or the `within_ms` budget expires. A
-  missing substring is no longer a failure on its own, since more text may
+  `llm_response` now accumulates successive segments and re-checks on each,
+  until the check passes, the judge rejects, or the `within_ms` budget expires.
+  A missing substring is no longer a failure on its own, since more text may
   follow, so a scenario asserting text that never arrives now waits out its
   budget: set `within_ms` on such an assertion.
 
@@ -2954,8 +2989,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   interface changed to match: `AddUserMessage`, `AddAssistantMessage` and
   `Evaluate(ctx, criterion) JudgeVerdict`. A judge that cannot answer reports a
   no with the reason rather than failing the run. Because a judge now holds a
-  conversation, it is per-scenario: `RunSuite` takes a `func() Judge` rather than
-  a `Judge`.
+  conversation, it is per-scenario: `RunSuite` takes a `func() Judge` rather
+  than a `Judge`.
 
 - **An interrupted response is no longer attributed to the next turn.** On a
   barge-in or a run-immediately interrupt the harness drops the bot's queued,
@@ -2968,8 +3003,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   state, so the turns after it only burn another budget each.
 
 - **`text_contains` is case-sensitive**, and the default latency budget for an
-  expectation without `within_ms` is 60s rather than 15s. The handshake keeps its
-  own, much shorter budget: a bot has 10s to announce readiness.
+  expectation without `within_ms` is 60s rather than 15s. The handshake keeps
+  its own, much shorter budget: a bot has 10s to announce readiness.
 
 - **RTVI function-call events now report the tool call id alone by default.**
   The function name, its arguments and its result are withheld until the
@@ -2978,21 +3013,21 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   seeing, and the safe default is the one that leaks nothing. A client that
   relied on `function_name` being present needs
   `rtvi.NewObserverWithParams(proc, rtvi.ObserverParams{FunctionCallReportLevel:
-  map[string]rtvi.FunctionCallReportLevel{"*": rtvi.ReportName}})`. Raising the
-  level over the wire is possible only through the eval serializer, so a remote
-  client cannot elevate a production bot.
+  map[string]rtvi.FunctionCallReportLevel{"*": rtvi.ReportName}})`.
+  Raising the level over the wire is possible only through the eval serializer,
+  so a remote client cannot elevate a production bot.
 
 ### Fixed
 
 - **`LLMContext.Messages` handed out an aliased tool result.** It copied the
   message slice but not what each message pointed at, so every caller shared one
   `ToolResults` array with the conversation. That was safe while results were
-  only ever appended. It stopped being safe once a result started being rewritten
-  in place when its call reports: a provider rendering a request could be reading
-  the very element the aggregator was writing. Messages now copies deep enough
-  that a snapshot means what it said when it was taken, and `SetMessages` copies
-  its input so a caller keeping that slice cannot reach back into the
-  conversation.
+  only ever appended. It stopped being safe once a result started being
+  rewritten in place when its call reports: a provider rendering a request could
+  be reading the very element the aggregator was writing. Messages now copies
+  deep enough that a snapshot means what it said when it was taken, and
+  `SetMessages` copies its input so a caller keeping that slice cannot reach
+  back into the conversation.
 
 ### Changed
 
@@ -3001,8 +3036,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   last processor in the pipeline, so forwarding them told nobody anything.
   Everything that needs them is reached another way: the LLM service broadcasts
   each one upstream as well as down, which is how the idle watchdog and the mute
-  strategies see them from inside the user aggregator, and an RTVI processor sits
-  between the LLM and the output.
+  strategies see them from inside the user aggregator, and an RTVI processor
+  sits between the LLM and the output.
 - **A tool call and the message answering it are now written together**, the
   moment the call starts, and the result replaces that placeholder where it sits
   rather than being appended at the tail. The conversation used to hold the
@@ -3012,18 +3047,18 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   it. Worse, the user aggregator sits upstream of the LLM and writes to the same
   conversation, so a new user turn could land while a tool was still running and
   the buffered results would then be appended after it, separated from the calls
-  they answered for the rest of the session. A tool that ended the turn made this
-  reachable in ordinary use. Every call now carries a placeholder from the
-  instant it starts, so the conversation is valid at every moment and a
-  barge-in needs no balancing of its own: it marks the placeholder canceled where
-  it already is. Each call gets a message of its own, which the Anthropic
-  provider merges back into the grouped form that API documents, and which the
-  Gemini provider now pairs by call id rather than by tool name. `LLMContext`
-  gains `AddAssistantToolCall`, `AddToolResult`, `AddMessage` and
-  `UpdateToolResult` in place of `AddAssistantToolCalls` and `AddToolResults`;
-  `ToolResult.IsError` and `FunctionCallsStartedFrame.PreambleText` are gone, and
-  the function-call frames change class: the two that write to the conversation
-  are uninterruptible, the two that announce a change of state are system frames.
+  they answered for the rest of the session. A tool that ended the turn made
+  this reachable in ordinary use. Every call now carries a placeholder from the
+  instant it starts, so the conversation is valid at every moment and a barge-in
+  needs no balancing of its own: it marks the placeholder canceled where it
+  already is. Each call gets a message of its own, which the Anthropic provider
+  merges back into the grouped form that API documents, and which the Gemini
+  provider now pairs by call id rather than by tool name. `LLMContext` gains
+  `AddAssistantToolCall`, `AddToolResult`, `AddMessage` and `UpdateToolResult`
+  in place of `AddAssistantToolCalls` and `AddToolResults`; `ToolResult.IsError`
+  and `FunctionCallsStartedFrame.PreambleText` are gone, and the function-call
+  frames change class: the two that write to the conversation are
+  uninterruptible, the two that announce a change of state are system frames.
 - **A tool handler reports its result through a callback** rather than returning
   it, so a call can have more than one thing to say. `llm.ToolHandler` becomes
   `llm.FunctionCallHandler`, taking an `llm.FunctionCallParams` and reporting
@@ -3034,18 +3069,19 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   reports `frames.FunctionCallResultProperties{RunLLM: &no}`. Registering with
   `llm.WithCancelOnInterruption(false)` makes a tool asynchronous: the model
   carries on rather than waiting, the call survives a barge-in, and each result
-  it reports reaches the model on a later turn as a developer message. Calls made
-  in one response share a group id, so a turn that requested several answers with
-  a single inference rather than one per call. An interruption now cancels the
-  calls registered to be canceled and announces each one, in place of dropping
-  whatever result happened to arrive after the frame context was canceled, which
-  lost results that had already been produced.
+  it reports reaches the model on a later turn as a developer message. Calls
+  made in one response share a group id, so a turn that requested several
+  answers with a single inference rather than one per call. An interruption now
+  cancels the calls registered to be canceled and announces each one, in place
+  of dropping whatever result happened to arrive after the frame context was
+  canceled, which lost results that had already been produced.
 - **The Kyutai moshi-server services moved to `provider/kyutai/moshi`.** Kyutai
   now offers two self-hosted models in the tree, moshi-server and Pocket TTS, so
   the vendor directory holds one package per server the way `aws`, `azure` and
   `openai` do. Update the import path and the qualifier: `kyutai.NewSTT` becomes
   `moshi.NewSTT`. Nothing about the services themselves changed, the processor
-  names `KyutaiSTT` and `KyutaiTTS` included, so metrics and logs read as before.
+  names `KyutaiSTT` and `KyutaiTTS` included, so metrics and logs read as
+  before.
 - **A task traces the session it runs**, so a call is one trace shaped like the
   conversation it recorded: a `conversation` span at the root, a `turn` span per
   turn beneath it, and each turn's STT, LLM and TTS spans beneath that.
@@ -3054,13 +3090,13 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   `turn.number`, `turn.duration_seconds`, `turn.was_interrupted` and
   `turn.user_bot_latency_seconds`, and the conversation span carries whatever
   attributes the caller adds — which is where a backend's own grouping keys go
-  (`langfuse.session.id`, `langfuse.user.id`). Services parent their spans to the
-  turn through the new `tracing.TracingContext`, handed to them at setup as
-  `processor.Setup.Tracing` and reachable as `processor.Base.Tracing()`, so a span
-  raised away from the frame path — a TTS synthesis played out on the audio queue
-  — lands under the turn it belongs to instead of starting a trace of its own.
-  `tracing.StartConversation` is gone: the task opens the conversation span now,
-  and `observers.TurnTrace` writes it.
+  (`langfuse.session.id`, `langfuse.user.id`). Services parent their spans to
+  the turn through the new `tracing.TracingContext`, handed to them at setup as
+  `processor.Setup.Tracing` and reachable as `processor.Base.Tracing()`, so a
+  span raised away from the frame path — a TTS synthesis played out on the audio
+  queue — lands under the turn it belongs to instead of starting a trace of its
+  own. `tracing.StartConversation` is gone: the task opens the conversation span
+  now, and `observers.TurnTrace` writes it.
 - **A websocket service no longer reconnects once its session is over.** A read
   that fails because the context is done would redial on that same finished
   context and fail every attempt, so the end of every call logged a burst of
@@ -3070,28 +3106,28 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   optional fields it now has `Data []frames.MetricsData`, whose concrete types
   are `TTFBMetricsData`, `TTFAMetricsData`, `ProcessingMetricsData`,
   `LLMUsageMetricsData`, `STTUsageMetricsData`, `TTSUsageMetricsData`,
-  `TextAggregationMetricsData` and `TurnMetricsData`, each carrying the processor
-  that measured it and the model it is attributed to. Read them by switching on
-  the type. `frames.TurnPrediction` is gone, replaced by `TurnMetricsData`, and
-  `NewMetricsFrame` now takes the measurements rather than a processor name. A
-  frame that reported one processor could not say what a pipeline-wide report
-  needs to say.
+  `TextAggregationMetricsData` and `TurnMetricsData`, each carrying the
+  processor that measured it and the model it is attributed to. Read them by
+  switching on the type. `frames.TurnPrediction` is gone, replaced by
+  `TurnMetricsData`, and `NewMetricsFrame` now takes the measurements rather
+  than a processor name. A frame that reported one processor could not say what
+  a pipeline-wide report needs to say.
 - **A TTS service reports what grouping text into sentences costs**, as a
-  `TextAggregationMetricsData` on a `MetricsFrame`: the wait from a model's first
-  token to the sentence it completes, which is the delay before synthesis of that
-  sentence can start. Nothing is reported when the service passes tokens straight
-  through, since per-token aggregation time means nothing. `ttstext.Aggregator`
-  gains `Type`, reporting how it groups text, which is what says whether there is
-  anything to measure.
+  `TextAggregationMetricsData` on a `MetricsFrame`: the wait from a model's
+  first token to the sentence it completes, which is the delay before synthesis
+  of that sentence can start. Nothing is reported when the service passes tokens
+  straight through, since per-token aggregation time means nothing.
+  `ttstext.Aggregator` gains `Type`, reporting how it groups text, which is what
+  says whether there is anything to measure.
 - **A speech-to-text service reports the audio it was given in band**, as an
   `STTUsageMetricsData` on a `MetricsFrame`, gated on `EnableUsageMetrics` like
   the token usage an LLM reports. It was measured already but only ever reached
-  OpenTelemetry, so an in-band consumer such as an RTVI client could bill LLM and
-  TTS use but not STT.
-- **The RTVI metrics message gained `ttfa`, `stt_usage` and `text_aggregation`**,
-  and now reports every measurement a frame carries rather than one processor's.
-  Time to the first audible sample was measured and dropped on the way to the
-  client.
+  OpenTelemetry, so an in-band consumer such as an RTVI client could bill LLM
+  and TTS use but not STT.
+- **The RTVI metrics message gained `ttfa`, `stt_usage` and
+  `text_aggregation`**, and now reports every measurement a frame carries rather
+  than one processor's. Time to the first audible sample was measured and
+  dropped on the way to the client.
 - **Word timings are reported to the TTS base a batch at a time**, not one token
   at a time: `tts.WordTimestamps.RunTTSTimed` now takes
   `word(words []uctx.WordTiming, opts tts.WordTimingOptions)`, and
@@ -3101,39 +3137,40 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - **Punctuation merging moved from the providers into the base**, asked for with
   `tts.WordTimingOptions{PreMergeTokens: true}` and off by default. It was done
   by each provider that happened to need it, so of the four reporting word
-  timings two merged and two did not, with no way to tell from the outside which.
+  timings two merged and two did not, with no way to tell from the outside
+  which.
 
 - **Voice detection gates on volume as well as confidence.** `vad.Params` gains
   `MinVolume`, 0.6 by default, and a frame counts as speech only when the model
   is confident enough about it and it is loud enough to be worth hearing. A
-  confident guess at something barely audible no longer opens a turn. Set it to 0
-  for the previous confidence-only behaviour.
+  confident guess at something barely audible no longer opens a turn. Set it to
+  0 for the previous confidence-only behaviour.
 - **`audio/loudness`**, measuring loudness to ITU-R BS.1770 (EBU R128): the
   K-weighting filter pair, gated block loudness, and normalisation onto a 0..1
   scale. It is what the volume gate reads, so the gate follows how the ear hears
   rather than raw amplitude.
 - **Voice detection moved out of the processor into `audio/vad/controller`.**
   The controller owns the detection state, the resampling the detector needs and
-  the watch for audio that stops arriving, so anything needing the same detection
-  can drive it without going through a pipeline. `processor/vadproc` now just
-  hosts one and turns what it reports into frames.
+  the watch for audio that stops arriving, so anything needing the same
+  detection can drive it without going through a pipeline. `processor/vadproc`
+  now just hosts one and turns what it reports into frames.
 - **The VAD frames are broadcast rather than pushed downstream.**
   `VADUserStartedSpeakingFrame`, `VADUserStoppedSpeakingFrame` and
   `UserSpeakingFrame` now reach processors on both sides of the detector, which
   is what an interruption decision upstream needs.
-- **`UserSpeakingFrame` is emitted for every chunk heard as speech**, rather than
-  at a fixed period. `vadproc.Config.SpeechActivityPeriod` is gone with the
+- **`UserSpeakingFrame` is emitted for every chunk heard as speech**, rather
+  than at a fixed period. `vadproc.Config.SpeechActivityPeriod` is gone with the
   throttle it configured.
-- **`frames.SpeechControlParamsFrame` carries the parameter sets themselves.** It
-  held three flattened turn timings and no VAD parameters at all; it now carries
-  `*vad.Params` and `*turn.Params`, either of which may be nil. It is reported
-  when the pipeline starts and whenever the parameters change.
+- **`frames.SpeechControlParamsFrame` carries the parameter sets themselves.**
+  It held three flattened turn timings and no VAD parameters at all; it now
+  carries `*vad.Params` and `*turn.Params`, either of which may be nil. It is
+  reported when the pipeline starts and whenever the parameters change.
 - **A barge-in keeps the frames that must survive it.** The output dropped
   everything it had queued when the user interrupted, uninterruptible frames
   included, so a frame marked to always be delivered was not. It now keeps them
-  and drops the rest. When nothing queued has to survive and no mixer is running,
-  the sender is restarted instead, which cuts short a write already in flight
-  rather than leaving the barge-in waiting behind it.
+  and drops the rest. When nothing queued has to survive and no mixer is
+  running, the sender is restarted instead, which cuts short a write already in
+  flight rather than leaving the barge-in waiting behind it.
 - **The output's audio queue is no longer bounded at 256 frames.** Expressing
   "drop these but keep those" needs a queue rather than a channel, and the queue
   is unbounded, so a producer running ahead of playback is no longer blocked by
@@ -3144,11 +3181,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   is uninterruptible, so a barge-in still lets it finish rather than stranding a
   waiter.
 - **Frames leaving the output wait for the audio they were queued behind.** A
-  downstream frame carrying neither audio nor a presentation timestamp used to be
-  forwarded the moment it arrived, overtaking the audio around it by however much
-  was buffered. It is now queued behind that audio and forwarded in step with
-  playback. System frames still go straight through, as does anything travelling
-  upstream.
+  downstream frame carrying neither audio nor a presentation timestamp used to
+  be forwarded the moment it arrived, overtaking the audio around it by however
+  much was buffered. It is now queued behind that audio and forwarded in step
+  with playback. System frames still go straight through, as does anything
+  travelling upstream.
 - **`frames.OutputTransportMessageFrame` is sent in step with the audio around
   it** rather than the moment it arrives, which is what makes it the ordered
   counterpart of the urgent one. The urgent frame is still sent at once, and is
@@ -3162,11 +3199,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   buffer, so a transport can read the outgoing stream a chunk is addressed to
   alongside its samples. Implementations take a `frames.OutputAudioFrame` and
   read the samples from `AudioData().Audio`.
-- **The frames carrying output audio are now a family**, `frames.OutputAudioFrame`,
-  covering `OutputAudioRawFrame`, `TTSAudioRawFrame` and the new
-  `SpeechOutputAudioRawFrame`. Match the interface rather than a concrete type,
-  or audio of a kind that was not named goes unhandled. `InputAudioRawFrame` is
-  outside the family, since it is never sent.
+- **The frames carrying output audio are now a family**,
+  `frames.OutputAudioFrame`, covering `OutputAudioRawFrame`, `TTSAudioRawFrame`
+  and the new `SpeechOutputAudioRawFrame`. Match the interface rather than a
+  concrete type, or audio of a kind that was not named goes unhandled.
+  `InputAudioRawFrame` is outside the family, since it is never sent.
 
 ### Added
 
@@ -3178,28 +3215,27 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - **Tool calls can be bounded, sequenced and observed.**
   `llm.WithFunctionCallTimeout` bounds every call and `llm.WithTimeout` bounds
   one function's; a call that overruns is given up on and records as completed
-  rather than answering on the tool's behalf.
-  `llm.WithSequentialFunctionCalls` runs the calls of one response one after
-  another, for tools that share something not safe to use concurrently.
-  `llm.WithUngroupedFunctionCalls` re-runs generation per result instead of once
-  the batch finishes. A handler registered under the empty name is a catch-all,
-  taking any call no named handler claims; `llm.Base.UnregisterFunction` and
-  `HasFunction` manage the registry, and `OnFunctionCallsStarted` /
-  `OnFunctionCallsCanceled` report which calls a response started and which an
-  interruption took away. A call nothing claims now says which of the two ways
-  that happened: a tool advertised with nothing behind it reads as the wiring
-  mistake it almost always is, while a tool nothing advertises is the model
-  inventing one.
+  rather than answering on the tool's behalf. `llm.WithSequentialFunctionCalls`
+  runs the calls of one response one after another, for tools that share
+  something not safe to use concurrently. `llm.WithUngroupedFunctionCalls`
+  re-runs generation per result instead of once the batch finishes. A handler
+  registered under the empty name is a catch-all, taking any call no named
+  handler claims; `llm.Base.UnregisterFunction` and `HasFunction` manage the
+  registry, and `OnFunctionCallsStarted` / `OnFunctionCallsCanceled` report
+  which calls a response started and which an interruption took away. A call
+  nothing claims now says which of the two ways that happened: a tool advertised
+  with nothing behind it reads as the wiring mistake it almost always is, while
+  a tool nothing advertises is the model inventing one.
 - **`llm.WithAsyncToolCancellation` lets the model abandon background work it no
   longer needs.** A tool registered to survive an interruption keeps running
-  through a barge-in, so its result can arrive into a conversation that has moved
-  on. With this on, the service offers a built-in `cancel_async_tool_call`
+  through a barge-in, so its result can arrive into a conversation that has
+  moved on. With this on, the service offers a built-in `cancel_async_tool_call`
   alongside the conversation's own tools, and appends instructions telling the
-  model how to read the id of a call still running out of the async-tool messages
-  already in the conversation. Both appear only while such a tool is registered.
-  `llm.Base.CancelAsyncToolCall` does the same on the application's own account.
-  What the service adds is kept apart from what the application set:
-  `LLMContext.Tools` and `System` fold it in for the request, and
+  model how to read the id of a call still running out of the async-tool
+  messages already in the conversation. Both appear only while such a tool is
+  registered. `llm.Base.CancelAsyncToolCall` does the same on the application's
+  own account. What the service adds is kept apart from what the application
+  set: `LLMContext.Tools` and `System` fold it in for the request, and
   `LLMContext.AppTools` answers what the application itself offers.
 - **`processor.Base.HasQueuedFrame` reports whether a matching frame is still
   waiting** in a processor's in-order queue, behind the one it is handling. A
@@ -3211,34 +3247,35 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   opened with rather than one reading per turn. The `StartFrame` has carried the
   setting since the field existed; nothing read it, so asking for it changed
   nothing. The LLM, TTS and STT services now measure the first and decline the
-  rest, and `processor.Base.BeginTTFB` is where a service asks whether to measure.
+  rest, and `processor.Base.BeginTTFB` is where a service asks whether to
+  measure.
 - **An STT service reports how long it worked on an utterance**, as
   `ProcessingMetricsData` alongside the wait it left behind. A streaming service
   is timed from the VAD reporting speech to the transcript it produced; a
-  segmented one keeps timing the transcription itself, and now puts the figure on
-  the pipeline as well as into OpenTelemetry.
+  segmented one keeps timing the transcription itself, and now puts the figure
+  on the pipeline as well as into OpenTelemetry.
 - **The Smallest AI transcription carries every option the service accepts**:
   `WordTimestamps`, `FullTranscript`, `SentenceTimestamps`, `RedactPII`,
   `RedactPCI`, `Numerals`, `Diarize`, `Endpointing`, `Keywords` and `Format`,
   alongside the model. Endpointing and formatting are on unless turned off, as
   they are on the service itself.
-- **AssemblyAI takes a list of declared languages**, as
-  `Config.LanguageCodes`: one pins the transcription to that language, several
-  steer towards that set while still letting the speaker switch between them, in
-  the order given. Regional variants resolve to their base code, so at most ten
-  distinct languages, which `Validate` checks rather than leaving the service to
-  close the session over it. The steering is prompt-based, so it is sent to U3
-  Pro models alone.
+- **AssemblyAI takes a list of declared languages**, as `Config.LanguageCodes`:
+  one pins the transcription to that language, several steer towards that set
+  while still letting the speaker switch between them, in the order given.
+  Regional variants resolve to their base code, so at most ten distinct
+  languages, which `Validate` checks rather than leaving the service to close
+  the session over it. The steering is prompt-based, so it is sent to U3 Pro
+  models alone.
 - **`provider/kyutai/pockettts`**, speech synthesis from a local Pocket TTS
-  server (`pocket-tts serve`): a small CPU-only model whose audio streams back as
-  it is generated, so the first samples arrive well before the sentence is
+  server (`pocket-tts serve`): a small CPU-only model whose audio streams back
+  as it is generated, so the first samples arrive well before the sentence is
   finished. The voice is per request, either a name the server knows or a URL of
   a recording to clone; the language belongs to the server, which loads its
   weights per language when it starts.
 - **The LiveKit transport reads inbound SIP DTMF.** A key pressed by a caller on
-  a SIP leg of the room becomes an `InputDTMFFrame`, so the DTMF aggregator works
-  on a LiveKit call as it does on a telephony one. `frames.KeypadEntry.Valid`
-  reports whether what arrived is a key at all.
+  a SIP leg of the room becomes an `InputDTMFFrame`, so the DTMF aggregator
+  works on a LiveKit call as it does on a telephony one.
+  `frames.KeypadEntry.Valid` reports whether what arrived is a key at all.
 - **Azure speech synthesis takes `ForceLocale`**, wrapping the text in SSML's
   `<lang>` element so a multilingual voice speaks in the configured language
   rather than the one it reads out of the text.
@@ -3265,8 +3302,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 - **The Smallest AI transcription opens the Waves v4 session** at
   `/waves/v1/stt/live` and flushes each utterance with a `finalize` message when
-  the VAD reports the speech ended, keeping the session open for the next one.
-  A `Stream` asks for that by implementing the new `stt.Finalizer`; a provider
+  the VAD reports the speech ended, keeping the session open for the next one. A
+  `Stream` asks for that by implementing the new `stt.Finalizer`; a provider
   that does its own endpointing is left alone.
 - **The Cartesia transcription connects with `Cartesia-Version: 2026-03-01`**,
   the version its TTS and turn-taking services already used.
@@ -3283,34 +3320,35 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   written with the result thrown away, so a session that had dropped underneath
   was fed for the rest of the call without one line in the log, and a call that
   went quiet gave nothing to say whether the provider heard nothing or the audio
-  never reached it. A failed send is now logged once and takes the session out of
-  use until the read loop opens another.
+  never reached it. A failed send is now logged once and takes the session out
+  of use until the read loop opens another.
 - **The Deepgram reader logs a message it does not know about.** A session sends
   `Results`, `Metadata`, `SpeechStarted` and `UtteranceEnd`; anything else was
   dropped as quietly as those, which is where a session that has stopped
-  transcribing hid. A message that does not parse at all now ends the session for
-  the read loop to reopen, rather than being read past. Its keepalive moved from
-  eight seconds to five, the interval Deepgram asks for, and a keepalive that
-  fails to land is logged rather than discarded. The Flux reader logs a message
-  that does not decode, which it still skips.
+  transcribing hid. A message that does not parse at all now ends the session
+  for the read loop to reopen, rather than being read past. Its keepalive moved
+  from eight seconds to five, the interval Deepgram asks for, and a keepalive
+  that fails to land is logged rather than discarded. The Flux reader logs a
+  message that does not decode, which it still skips.
 - **An STT service reports how long its transcript kept the conversation
   waiting.** Neither STT service measured anything, so the one latency that
   decides how quickly a bot can answer was the only one missing from the
   pipeline's metrics. Both now measure from the moment the speech ended (the
-  VAD's determination less the silence it required, not the moment it decided) to
-  the transcript that closes the utterance, and report it as `TTFBMetricsData` and
-  to OpenTelemetry under `stt`. When no closing transcript arrives, a deadline
-  reports the wait to the last one that did, and reports nothing when there was
-  none. `SetTTFBTimeout` sets that deadline, two seconds by default.
-- **A transcript is marked final on the provider's word, not on its endpointing.**
-  A streaming STT service now records the finalize it asks for when the speech
-  ends and matches it against the provider's confirmation, and only the
-  transcript answering a confirmed finalize is marked as closing the utterance.
-  `stt.Result` gains `FromFinalize` for a provider to report that confirmation; a
-  provider that flushes without confirming still says what it knows through
-  `EndOfTurn`. Deepgram now sends that finalize (it never did) and reads
-  `from_finalize` in the answer, in place of treating its own `speech_final` as
-  the end of the turn.
+  VAD's determination less the silence it required, not the moment it decided)
+  to the transcript that closes the utterance, and report it as
+  `TTFBMetricsData` and to OpenTelemetry under `stt`. When no closing transcript
+  arrives, a deadline reports the wait to the last one that did, and reports
+  nothing when there was none. `SetTTFBTimeout` sets that deadline, two seconds
+  by default.
+- **A transcript is marked final on the provider's word, not on its
+  endpointing.** A streaming STT service now records the finalize it asks for
+  when the speech ends and matches it against the provider's confirmation, and
+  only the transcript answering a confirmed finalize is marked as closing the
+  utterance. `stt.Result` gains `FromFinalize` for a provider to report that
+  confirmation; a provider that flushes without confirming still says what it
+  knows through `EndOfTurn`. Deepgram now sends that finalize (it never did) and
+  reads `from_finalize` in the answer, in place of treating its own
+  `speech_final` as the end of the turn.
 - **A WebSocket service stops redialing a handshake the server refused.** A
   rejected key or a model an account cannot use was retried three times with a
   backoff in between, delaying the error the caller needed to see. `wsutil.Dial`
@@ -3370,9 +3408,9 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   frame.** It waited for a `StartFrame`, `EndFrame` or `CancelFrame` to reach
   every branch by blocking on the goroutine handling it. An `EndFrame` is a
   control frame, so that left the system-frame path open: an interruption
-  arriving mid-shutdown was fanned into the branches, where it flushed the output
-  they still had queued to send ahead of the `EndFrame`. The synchronization now
-  pauses both paths, which is what the wait was for.
+  arriving mid-shutdown was fanned into the branches, where it flushed the
+  output they still had queued to send ahead of the `EndFrame`. The
+  synchronization now pauses both paths, which is what the wait was for.
 - **A parallel pipeline no longer swallows a lifecycle frame a branch raised
   itself.** Such a frame was never fanned out, so it had no synchronization
   counter and was dropped at the branch sink. A processor inside a branch ending
@@ -3395,25 +3433,25 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   downstream. It reached the output while a provider delivering on its own
   receive loop was still sending audio, so the output drained what little it had
   and stopped. The `EndFrame` now shuts the serialization queue down and waits
-  for it, which puts the last of the audio, and anything queued behind it such as
-  a closing chime, downstream before the frame that ends the pipeline.
+  for it, which puts the last of the audio, and anything queued behind it such
+  as a closing chime, downstream before the frame that ends the pipeline.
 
-- **A tool call no longer holds up the frames queued behind it.** Handlers ran on
-  the goroutine that processes the LLM service's frames, so nothing queued while
-  one was in flight moved until it returned — including the speech a bot plays to
-  cover the wait, which is defeated by exactly the slow tools it exists for. Each
-  call now runs on its own goroutine; the assistant aggregator already holds the
-  results until the last one is in, so calls finishing out of order costs nothing,
-  and a result arriving after an interruption is dropped rather than added to the
-  synthetic one that already balanced the call.
+- **A tool call no longer holds up the frames queued behind it.** Handlers ran
+  on the goroutine that processes the LLM service's frames, so nothing queued
+  while one was in flight moved until it returned — including the speech a bot
+  plays to cover the wait, which is defeated by exactly the slow tools it exists
+  for. Each call now runs on its own goroutine; the assistant aggregator already
+  holds the results until the last one is in, so calls finishing out of order
+  costs nothing, and a result arriving after an interruption is dropped rather
+  than added to the synthetic one that already balanced the call.
 
 - **Time to first byte is recorded for a turn that only requests tools.** It was
   measured on the first text delta, so a generation whose whole answer is a
   tool-use block reported no TTFB at all — the turns where the wait is longest
   and least visible. `llm.Base` gains `StartTTFBMetrics` and `StopTTFBMetrics`,
   and each LLM service records it around the point its response stream opens.
-  For an SDK that retries inside the call that opens the stream, the retry is now
-  part of the measurement rather than invisible.
+  For an SDK that retries inside the call that opens the stream, the retry is
+  now part of the measurement rather than invisible.
 
 - **A barge-in during playback no longer races the sequencer.** Clearing it when
   the user interrupts runs on the goroutine processing frames, while completing
@@ -3428,12 +3466,12 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   nothing, so it never reached the pipeline at all.
 
 - **The assistant's turns reached the conversation again** with a TTS provider
-  that delivers its audio on its own receive loop rather than inline, and no word
-  timestamps. With no word timings the whole-unit text frame is the only thing
-  carrying a turn into the context, and it was emitted only when the provider had
-  answered inline, so every turn of such a provider was left out. Each new turn
-  then saw nothing but a run of user messages, and the bot repeated itself and
-  re-asked what it had just been told.
+  that delivers its audio on its own receive loop rather than inline, and no
+  word timestamps. With no word timings the whole-unit text frame is the only
+  thing carrying a turn into the context, and it was emitted only when the
+  provider had answered inline, so every turn of such a provider was left out.
+  Each new turn then saw nothing but a run of user messages, and the bot
+  repeated itself and re-asked what it had just been told.
 
 ### Added
 
@@ -3443,8 +3481,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   merges an update into what a service holds and reports which fields moved and
   what they held before, so a service reacts only to a real change. A field
   carries three states rather than two: not given, given a value, and given no
-  value, the last being how a caller asks a service to drop a setting rather than
-  leave it alone. `settings.FromMap` builds an update from plain names and
+  value, the last being how a caller asks a service to drop a setting rather
+  than leave it alone. `settings.FromMap` builds an update from plain names and
   values, resolving aliases and keeping provider-specific keys, for one arriving
   over the wire. The carriers are `LLMUpdateSettingsFrame`,
   `TTSUpdateSettingsFrame` and `STTUpdateSettingsFrame`: control frames, applied
@@ -3468,32 +3506,33 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   Cartesia STT follows, with the model, the language and keyterms, and Soniox
   STT with the model, the language hints and the nine options it is told in its
   handshake. All three reopen the session on any change, because all three are
-  told their configuration only when the session opens. Cartesia's turn-detecting
-  service reopens for a keyterm change alone and reports any other change as one
-  that cannot take effect. The remaining providers are unchanged and keep taking
-  their configuration at construction.
+  told their configuration only when the session opens. Cartesia's
+  turn-detecting service reopens for a keyterm change alone and reports any
+  other change as one that cannot take effect. The remaining providers are
+  unchanged and keep taking their configuration at construction.
 - **Cartesia and Soniox STT gained the options they were missing.** Cartesia
   takes `Keyterm`, capped at the 100 terms and 1200 characters a connection
   accepts and sent only on the ink-2 models that honor them, with spaces
   percent-encoded as Cartesia requires. Soniox takes `LanguageHintsStrict`,
   `Context`, `EnableSpeakerDiarization`, `EnableLanguageIdentification`,
-  `MaxEndpointDelayMs`, `EndpointSensitivity`,
-  `EndpointLatencyAdjustmentLevel` and `ClientReferenceID`. An option nobody sets
-  is left out of the request, so the service applies its own default rather than
-  being sent a zero that means something else.
+  `MaxEndpointDelayMs`, `EndpointSensitivity`, `EndpointLatencyAdjustmentLevel`
+  and `ClientReferenceID`. An option nobody sets is left out of the request, so
+  the service applies its own default rather than being sent a zero that means
+  something else.
 - **A transcription session reopened for a settings change waits for the user to
-  stop speaking**, and the audio arriving in between is held and sent on once the
-  new session is up. Replacing the session mid-sentence would drop what is being
-  said, and the words lost would be the ones the change was meant to transcribe
-  better. A change asked for while nobody is speaking takes effect at once.
+  stop speaking**, and the audio arriving in between is held and sent on once
+  the new session is up. Replacing the session mid-sentence would drop what is
+  being said, and the words lost would be the ones the change was meant to
+  transcribe better. A change asked for while nobody is speaking takes effect at
+  once.
 - **A streaming speech-to-text session can be held open while it carries no
   audio**, for the providers that close an idle one. Silence reaches the service
   whenever nobody is speaking, and a service switched out of the pipeline sends
   nothing at all, so an idle session is ordinary and losing it costs the next
   thing the user says. A `Connector` implementing `stt.Keepaliver` says how long
   a session may go quiet before silence is submitted to hold it open, and how
-  often to look. A `Stream` implementing `stt.KeepaliveSender` sends something of
-  the provider's own instead, for a service with a protocol message for this.
+  often to look. A `Stream` implementing `stt.KeepaliveSender` sends something
+  of the provider's own instead, for a service with a protocol message for this.
   Silence submitted as audio counts towards the session's usage, since the
   provider bills for it; a protocol message does not. A `Connector` that
   implements neither gets no keepalive.
@@ -3531,11 +3570,12 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   expect metrics from before any have been measured. It applies only when
   `EnableMetrics` is set, and nil defaults to true.
 - **`tts.Base.SetPauseFrameProcessing`**, pausing a TTS service's frame handling
-  from the moment a turn's text has been sent to the provider until the audio for
-  it has played, so the next turn cannot be synthesized over it. It is off unless
-  asked for. A watchdog force-resumes, and reports a non-fatal error, if nothing
-  confirms the audio is playing within `PauseOptions.WatchdogTimeout` (3s by
-  default), so a turn that produces no audio cannot pause the service for good.
+  from the moment a turn's text has been sent to the provider until the audio
+  for it has played, so the next turn cannot be synthesized over it. It is off
+  unless asked for. A watchdog force-resumes, and reports a non-fatal error, if
+  nothing confirms the audio is playing within `PauseOptions.WatchdogTimeout`
+  (3s by default), so a turn that produces no audio cannot pause the service for
+  good.
 - **Pausing a processor's frame handling**: `Base.PauseProcessingFrames` and
   `ResumeProcessingFrames` hold data and control frames, and
   `PauseProcessingSystemFrames` and `ResumeProcessingSystemFrames` hold system
@@ -3549,10 +3589,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   client request, say), and the analyzer adopts them from the next chunk.
   `vad.Analyzer` gains `SetParams` for it.
 - **`vadproc.Config.AudioIdleTimeout`**, ending the user's speech when the audio
-  stops arriving mid-utterance. Voice detection only ever hears silence as speech
-  ending, so audio that stops outright, a microphone muted part-way through being
-  the usual case, left the user speaking for good and the turn never closed. One
-  second by default; a negative value disables it.
+  stops arriving mid-utterance. Voice detection only ever hears silence as
+  speech ending, so audio that stops outright, a microphone muted part-way
+  through being the usual case, left the user speaking for good and the turn
+  never closed. One second by default; a negative value disables it.
 - **`Params.AudioOutEndSilenceSecs`**, how many seconds of silence follow the
   last of the audio when the pipeline ends, so the closing words are not clipped
   by whatever closes on top of them. Two seconds by default; 0 sends none.
@@ -3564,12 +3604,13 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   it returns does it start the senders and report the transport ready, so
   nothing is queued for a path that cannot carry it yet. Transports with nothing
   to open need not implement it.
-- **Several outgoing audio streams per transport.** `Params.AudioOutDestinations`
-  names them, `OutputDriver.RegisterAudioDestination` opens each one, and every
-  frame is routed to the stream its `TransportDestination` names. Each stream
-  keeps its own buffer, mixer, chunking and bot-speaking state, so a turn on one
-  neither shares a buffer with nor silences another. A frame naming a stream that
-  was never registered is dropped with a warning.
+- **Several outgoing audio streams per transport.**
+  `Params.AudioOutDestinations` names them,
+  `OutputDriver.RegisterAudioDestination` opens each one, and every frame is
+  routed to the stream its `TransportDestination` names. Each stream keeps its
+  own buffer, mixer, chunking and bot-speaking state, so a turn on one neither
+  shares a buffer with nor silences another. A frame naming a stream that was
+  never registered is dropped with a warning.
 - **`Params.AudioOutMixers`**, mapping a destination to the mixer serving it.
   `Params.AudioOutMixer` still serves the default stream, and now serves only
   that one rather than every stream at once.
@@ -3579,19 +3620,20 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   API expects; a self-hosted server reads `X-API-Key` and ignores that form, so
   a secured self-hosted deployment rejected every search and store. Empty keeps
   the managed default, and `mem0.HeaderXAPIKey` names the self-hosted one.
-- **ElevenLabs WebSocket text-to-speech** (`provider/elevenlabs.NewRealtimeTTS`),
-  the multi-stream-input protocol over a single connection held open for the
-  session. `NewTTS` issues an HTTP request per sentence, and since the TTS base
-  synthesizes a sentence at a time, every sentence boundary in a reply paid for
-  connection setup before its first audio came back — a pause the listener hears.
-  Each synthesis opens a context, sends its text, and closes it, which is what
-  makes the final marker arrive immediately after the last audio byte rather than
-  after the server waits to see whether more text is coming. Audio is attributed
-  by context id, so what the server had already generated for a synthesis
-  abandoned by an interruption cannot leak into the next sentence. Optionally
-  reports word timing (`WordTimestamps`): ElevenLabs times every character, and
-  those are assembled into words with `utils/context.CharAccumulator`, which lets
-  the assistant context record what was actually spoken when a turn is cut short.
+- **ElevenLabs WebSocket text-to-speech**
+  (`provider/elevenlabs.NewRealtimeTTS`), the multi-stream-input protocol over a
+  single connection held open for the session. `NewTTS` issues an HTTP request
+  per sentence, and since the TTS base synthesizes a sentence at a time, every
+  sentence boundary in a reply paid for connection setup before its first audio
+  came back — a pause the listener hears. Each synthesis opens a context, sends
+  its text, and closes it, which is what makes the final marker arrive
+  immediately after the last audio byte rather than after the server waits to
+  see whether more text is coming. Audio is attributed by context id, so what
+  the server had already generated for a synthesis abandoned by an interruption
+  cannot leak into the next sentence. Optionally reports word timing
+  (`WordTimestamps`): ElevenLabs times every character, and those are assembled
+  into words with `utils/context.CharAccumulator`, which lets the assistant
+  context record what was actually spoken when a turn is cut short.
 - **Four streaming speech-to-text variants**, each sitting alongside a service
   the provider already had:
 
@@ -3617,11 +3659,12 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - **Azure OpenAI Realtime speech-to-speech** (`provider/azure/realtime`), the
   Realtime service as served by an Azure OpenAI resource. It wraps
   `provider/openai/realtime` and changes only the addressing and authorization:
-  Azure selects the model with a `deployment` query parameter rather than a model
-  name, and authorizes with an `api-key` header rather than a bearer token. The
-  session URL is derived from the resource endpoint, deployment and API version,
-  and an https endpoint pasted from the portal is rewritten to `wss`. A whole URL
-  can be given instead for a deployment whose address is not derivable.
+  Azure selects the model with a `deployment` query parameter rather than a
+  model name, and authorizes with an `api-key` header rather than a bearer
+  token. The session URL is derived from the resource endpoint, deployment and
+  API version, and an https endpoint pasted from the portal is rewritten to
+  `wss`. A whole URL can be given instead for a deployment whose address is not
+  derivable.
 
 - **`realtime.NewWithConnector`**, the hook Azure hangs off. A
   `realtime.Connector` chooses how the Realtime session is addressed and
@@ -3633,18 +3676,18 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   chat-completions service. `NewLLM` holds a WebSocket open for the session and
   adds the API's incremental-context optimization: when the conversation has
   grown from where the previous turn left off, only the new items travel and the
-  server recalls the rest by response id. The conversation prefix is fingerprinted
-  so a history rewritten behind the service's back falls back to sending
-  everything rather than continuing from a copy that no longer matches. Both
-  support tool calling, take the system prompt as the API's own instructions
-  field rather than a leading message, and default to `store: false` so nothing
-  is retained server-side. The two connection-scoped failures (the server having
-  dropped the response being continued from, and the connection reaching its
-  lifetime limit) reconnect and retry with the full context; an interruption
-  does not. A barge-in cancels the response server-side and drains its remaining
-  events before the next turn starts, since the API gives no way to tell which
-  response a delta belongs to and stale events would otherwise be read as the
-  next turn's output.
+  server recalls the rest by response id. The conversation prefix is
+  fingerprinted so a history rewritten behind the service's back falls back to
+  sending everything rather than continuing from a copy that no longer matches.
+  Both support tool calling, take the system prompt as the API's own
+  instructions field rather than a leading message, and default to
+  `store: false` so nothing is retained server-side. The two connection-scoped
+  failures (the server having dropped the response being continued from, and the
+  connection reaching its lifetime limit) reconnect and retry with the full
+  context; an interruption does not. A barge-in cancels the response server-side
+  and drains its remaining events before the next turn starts, since the API
+  gives no way to tell which response a delta belongs to and stale events would
+  otherwise be read as the next turn's output.
 
 - **Google Vertex AI** (`provider/google/vertex`), Gemini as served by Vertex
   rather than the Gemini API: `NewLLM` for the cascaded model and `NewS2S` for
@@ -3652,10 +3695,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   only how requests are addressed and authorized, so their behavior, config
   fields and frame contract match. Vertex addresses a model by project and
   location on a regional endpoint and authorizes with a short-lived OAuth token.
-  Credentials are explicit: either a service-account key JSON, which is exchanged
-  for a token through a signed assertion, or a token source the application built
-  itself. jargo reads no environment variables, so Application Default
-  Credentials stay opt-in by passing their token source.
+  Credentials are explicit: either a service-account key JSON, which is
+  exchanged for a token through a signed assertion, or a token source the
+  application built itself. jargo reads no environment variables, so Application
+  Default Credentials stay opt-in by passing their token source.
 
 - **`gemini.NewShapedLLM` and `live.NewWithConnector`**, the hooks Vertex hangs
   off. A `gemini.RequestShaper` chooses how a generateContent request is
@@ -3685,8 +3728,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   word-aligned text path. Chinese and Japanese are written without spaces
   between words, so their characters are reported individually rather than
   assembled. It accepts a stock voice name or a cloned voice's id, a language, a
-  speaking rate, and any of Soniox's supported sample rates.
-  `provider/soniox` previously offered speech-to-text only.
+  speaking rate, and any of Soniox's supported sample rates. `provider/soniox`
+  previously offered speech-to-text only.
 
 - **`utils/context.CharAccumulator`**, which assembles per-character timings
   into whole words, carrying a word split across two batches into the next one.
@@ -3699,11 +3742,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   provider serves both NVIDIA's hosted endpoint and a locally deployed Riva/NIM,
   selected through `Server`, `UseSSL` and the auth fields. Each sentence opens a
   `SynthesizeOnline` stream and emits the audio as the server generates it; a
-  sentence past the model's request-length limit is split across several requests
-  on that one stream, so it is still generated as a single utterance. It supports
-  a custom IPA pronunciation dictionary, model-specific options, and the audio
-  prompt a zero-shot model clones its voice from. `provider/nvidia` previously
-  offered the LLM and STT only.
+  sentence past the model's request-length limit is split across several
+  requests on that one stream, so it is still generated as a single utterance.
+  It supports a custom IPA pronunciation dictionary, model-specific options, and
+  the audio prompt a zero-shot model clones its voice from. `provider/nvidia`
+  previously offered the LLM and STT only.
 
 - **`tts.Closer`**, an optional interface a `tts.Synthesizer` implements when it
   holds a resource open across syntheses. `tts.Base` closes it during cleanup,
@@ -3717,8 +3760,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   Live and Nova Sonic services and behaves the same way downstream: server VAD
   drives turn-taking and emits an `InterruptionFrame` on barge-in, the model's
   spoken reply arrives as audio frames and its transcript as `LLMTextFrame`s,
-  and token usage is reported on each completed response. Where xAI differs
-  from the OpenAI protocol it follows xAI: the model is chosen on the handshake
+  and token usage is reported on each completed response. Where xAI differs from
+  the OpenAI protocol it follows xAI: the model is chosen on the handshake
   rather than in the session, the session is configured only once the server
   opens the conversation, the audio format is nested per direction, and the
   session runs at a configurable sample rate (24 kHz by default) rather than a
@@ -3726,17 +3769,17 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   config alongside the pipeline's own function tools. As with the other
   speech-to-speech services, executing a function call is not yet wired up.
 
-- **xAI text-to-speech**, in two forms. `provider/xai/grok.NewTTS` streams synthesis
-  over a WebSocket, opening a session per sentence and emitting audio chunks as
-  they arrive; `provider/xai/grok.NewHTTPTTS` synthesizes each sentence in one request
-  against the batch endpoint. The streaming service reports word timings by
-  default: xAI sends per-character timings, which are assembled into words
-  (carrying a word split across payloads over to the next one) and drive the
-  word-aligned text path, so the assistant context records only what was
-  actually spoken before an interruption. Set `WordTimestamps` to false to fall
-  back to aggregated text frames. Both accept a voice, language, speaking rate,
-  latency-optimization level and text normalization, and both emit raw 16-bit
-  PCM at the configured rate.
+- **xAI text-to-speech**, in two forms. `provider/xai/grok.NewTTS` streams
+  synthesis over a WebSocket, opening a session per sentence and emitting audio
+  chunks as they arrive; `provider/xai/grok.NewHTTPTTS` synthesizes each
+  sentence in one request against the batch endpoint. The streaming service
+  reports word timings by default: xAI sends per-character timings, which are
+  assembled into words (carrying a word split across payloads over to the next
+  one) and drive the word-aligned text path, so the assistant context records
+  only what was actually spoken before an interruption. Set `WordTimestamps` to
+  false to fall back to aggregated text frames. Both accept a voice, language,
+  speaking rate, latency-optimization level and text normalization, and both
+  emit raw 16-bit PCM at the configured rate.
 
 - **xAI speech-to-text** (`provider/xai/grok.NewSTT`), a streaming transcription
   service over xAI's real-time WebSocket API. It holds one connection for the
@@ -3745,7 +3788,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   transcription), and surfaces the server's partial results as interim
   transcriptions and its endpointed results as finalized ones. Audio is withheld
   until the server acknowledges the session, and closing signals end of audio so
-  the last transcript is flushed. `provider/xai/grok` previously offered only the LLM.
+  the last transcript is flushed. `provider/xai/grok` previously offered only
+  the LLM.
 
 - **Opus inband FEC.** `transport.Params` gained `AudioOutFEC` and
   `AudioOutExpectedPacketLoss`, which enable forward error correction on the
@@ -3754,9 +3798,9 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   relayed media); on a clean link the redundancy is never decoded. Honored by
   the `libopus` build; the pure-Go SILK encoder ignores it.
 
-- **Pipeline lifecycle frames.** A processor with no handle on the `Task` can now
-  ask it to change the run's lifecycle, and the `Task` converts the request into
-  the matching pipeline-wide frame: `frames.CancelWorkerFrame` becomes a
+- **Pipeline lifecycle frames.** A processor with no handle on the `Task` can
+  now ask it to change the run's lifecycle, and the `Task` converts the request
+  into the matching pipeline-wide frame: `frames.CancelWorkerFrame` becomes a
   `CancelFrame`, `frames.StopWorkerFrame` a new `frames.StopFrame` (stop the run
   but leave processors running), and `frames.InterruptionWorkerFrame` an
   `InterruptionFrame`. `frames.EndWorkerFrame` already did this. The four now
@@ -3788,20 +3832,20 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   has one folder per service under a folder of its own, so the tree reads by
   vendor rather than by a flattened name. Import paths change accordingly:
 
-  | Was | Now |
-  |---|---|
-  | `provider/openai` | `provider/openai/chat` |
+  | Was                       | Now                        |
+  | ------------------------- | -------------------------- |
+  | `provider/openai`         | `provider/openai/chat`     |
   | `provider/openairealtime` | `provider/openai/realtime` |
-  | `provider/azureopenai` | `provider/azure/openai` |
-  | `provider/azurespeech` | `provider/azure/speech` |
-  | `provider/google` | `provider/google/gemini` |
-  | `provider/geminilive` | `provider/google/live` |
-  | `provider/xai` | `provider/xai/grok` |
-  | `provider/xairealtime` | `provider/xai/realtime` |
-  | `provider/bedrock` | `provider/aws/bedrock` |
-  | `provider/polly` | `provider/aws/polly` |
-  | `provider/transcribe` | `provider/aws/transcribe` |
-  | `provider/novasonic` | `provider/aws/novasonic` |
+  | `provider/azureopenai`    | `provider/azure/openai`    |
+  | `provider/azurespeech`    | `provider/azure/speech`    |
+  | `provider/google`         | `provider/google/gemini`   |
+  | `provider/geminilive`     | `provider/google/live`     |
+  | `provider/xai`            | `provider/xai/grok`        |
+  | `provider/xairealtime`    | `provider/xai/realtime`    |
+  | `provider/bedrock`        | `provider/aws/bedrock`     |
+  | `provider/polly`          | `provider/aws/polly`       |
+  | `provider/transcribe`     | `provider/aws/transcribe`  |
+  | `provider/novasonic`      | `provider/aws/novasonic`   |
 
   The package names follow the last path element, so `openai.LLMConfig` becomes
   `chat.LLMConfig`, `google.NewLLM` becomes `gemini.NewLLM`, and so on. Only the
@@ -3814,17 +3858,17 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   elsewhere and leaving room for the new FEC settings.
 - **Speech-to-speech services are told when tools change.** A realtime model
   generates continuously and never re-reads the shared context between turns, so
-  a toolset changed with `LLMContext.SetTools` never reached it. Tool changes now
-  travel as `frames.LLMSetToolsFrame`, and the OpenAI Realtime service renders
-  tools into its initial session configuration and sends a fresh `session.update`
-  whenever they change. `SetTools` and `SetToolChoice` remain for seeding a
-  context before the pipeline starts.
+  a toolset changed with `LLMContext.SetTools` never reached it. Tool changes
+  now travel as `frames.LLMSetToolsFrame`, and the OpenAI Realtime service
+  renders tools into its initial session configuration and sends a fresh
+  `session.update` whenever they change. `SetTools` and `SetToolChoice` remain
+  for seeding a context before the pipeline starts.
 - **`frames.OutputTransportMessageFrame` is a data frame again**, delivered in
-  order with the surrounding audio, for messages that must land in step with what
-  the bot is saying. The new `frames.OutputTransportMessageUrgentFrame` is the
-  system-frame variant that goes out immediately, ahead of queued audio; the RTVI
-  processor uses it. Previously the single frame had urgent semantics under the
-  ordered name and the ordered variant was unavailable.
+  order with the surrounding audio, for messages that must land in step with
+  what the bot is saying. The new `frames.OutputTransportMessageUrgentFrame` is
+  the system-frame variant that goes out immediately, ahead of queued audio; the
+  RTVI processor uses it. Previously the single frame had urgent semantics under
+  the ordered name and the ordered variant was unavailable.
 - **`frames.MixerControlFrame` is now the interface for the mixer control
   family**, with `frames.MixerUpdateSettingsFrame` carrying the settings map and
   `frames.MixerEnableFrame` carrying an `Enable` flag, replacing the single
@@ -3857,13 +3901,13 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - **`tts.Starter`**, the counterpart to `tts.Closer` at the other end of the
   pipeline's life: an optional interface a Synthesizer implements when it has
   setup to do before the first sentence, such as dialing the connection it will
-  reuse. Upstream every WebSocket TTS service connects in its `start(StartFrame)`
-  and none dials lazily, so this closes a gap rather than adding an optimization —
-  the Synthesizer contract had no way to take part in the pipeline starting.
-  `provider/elevenlabs.NewRealtimeTTS` implements it, having dialed on first use:
-  its handshake measured 2.3 s on a session's first synthesis against roughly
-  120 ms for every one after, all of it in the silence before the bot's opening
-  words.
+  reuse. Upstream every WebSocket TTS service connects in its
+  `start(StartFrame)` and none dials lazily, so this closes a gap rather than
+  adding an optimization — the Synthesizer contract had no way to take part in
+  the pipeline starting. `provider/elevenlabs.NewRealtimeTTS` implements it,
+  having dialed on first use: its handshake measured 2.3 s on a session's first
+  synthesis against roughly 120 ms for every one after, all of it in the silence
+  before the bot's opening words.
 
 ### Fixed
 
@@ -3871,64 +3915,65 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   shared read limit was set on the premise that a provider's base64 audio chunks
   fit comfortably below it; a TTS provider generating a long sentence in one go
   sends well past that, and the synthesis died part-way through a reply with
-  `message too big`. The limit exists to stop a server streaming without end, not
-  to bound a legitimate message, so it is now 16 MiB.
-- **The ElevenLabs WebSocket TTS produced no audio at all.** `auto_mode` was only
-  sent when the caller set it, and with it absent the server buffers text until an
-  explicit flush — then discards whatever was never flushed when the context
-  closes, answering with a final marker and an empty audio field. Every synthesis
-  therefore completed, quickly and without error, having emitted nothing.
-  `auto_mode` now defaults on, as upstream does; a caller driving generation with
-  its own flushes can still turn it off. The fake server in the tests accepted the
-  broken sequence, which is why this passed CI: it now generates only when auto
-  mode is on or a flush was sent, as the real one does.
+  `message too big`. The limit exists to stop a server streaming without end,
+  not to bound a legitimate message, so it is now 16 MiB.
+- **The ElevenLabs WebSocket TTS produced no audio at all.** `auto_mode` was
+  only sent when the caller set it, and with it absent the server buffers text
+  until an explicit flush — then discards whatever was never flushed when the
+  context closes, answering with a final marker and an empty audio field. Every
+  synthesis therefore completed, quickly and without error, having emitted
+  nothing. `auto_mode` now defaults on, as upstream does; a caller driving
+  generation with its own flushes can still turn it off. The fake server in the
+  tests accepted the broken sequence, which is why this passed CI: it now
+  generates only when auto mode is on or a flush was sent, as the real one does.
 - **`MinWordsStart` drops back to the single-word threshold as soon as a turn
-  opens.** It tracked the bot's speaking state only from the bot-speaking frames,
-  so after a barge-in it kept requiring `MinWords` until the interrupted bot's
-  stopped frame arrived, and the rest of that turn was held to the interruption
-  bar rather than the ordinary one. It now clears the flag on turn start, matching
-  the upstream strategy's `handle_user_turn_started`.
-- **`mem0` searches once per user message rather than once per context frame.** A
-  tool-calling turn replays the context after every round trip, and each replay
-  repeated the same retrieval — latency and load on the critical path before the
-  reply, for a result already in hand. Retrieval is now keyed on the user message
-  it was performed for. `Config.SearchTimeout` bounds that blocking retrieval
-  separately from `Timeout`, since a late memory is worse than a missing one when
-  a reply is waiting on it, and `Config.Prewarm` issues one throwaway search when
-  the session starts so the first real one does not pay to warm the path.
+  opens.** It tracked the bot's speaking state only from the bot-speaking
+  frames, so after a barge-in it kept requiring `MinWords` until the interrupted
+  bot's stopped frame arrived, and the rest of that turn was held to the
+  interruption bar rather than the ordinary one. It now clears the flag on turn
+  start, matching the upstream strategy's `handle_user_turn_started`.
+- **`mem0` searches once per user message rather than once per context frame.**
+  A tool-calling turn replays the context after every round trip, and each
+  replay repeated the same retrieval — latency and load on the critical path
+  before the reply, for a result already in hand. Retrieval is now keyed on the
+  user message it was performed for. `Config.SearchTimeout` bounds that blocking
+  retrieval separately from `Timeout`, since a late memory is worse than a
+  missing one when a reply is waiting on it, and `Config.Prewarm` issues one
+  throwaway search when the session starts so the first real one does not pay to
+  warm the path.
 - **The Pion sender's starvation counter no longer charges every utterance for
   its own ending.** It counted any silence sent within a fixed window after real
-  audio, but the window is also exactly what a normal end of speech looks like, so
-  the figure tracked how many times the bot spoke rather than how often the writer
-  fell behind — it read as a fault on every healthy session. A run of silence is
-  now only charged once real audio resumes after it, and the log reports the
-  number of gaps alongside the frame count.
+  audio, but the window is also exactly what a normal end of speech looks like,
+  so the figure tracked how many times the bot spoke rather than how often the
+  writer fell behind — it read as a fault on every healthy session. A run of
+  silence is now only charged once real audio resumes after it, and the log
+  reports the number of gaps alongside the frame count.
 - **The Anthropic prompt cache is now read, not only written.** The cache
   breakpoint sat at the end of the system prompt, which folds in the transient
   context a memory service recalls each turn. A cached prefix is only reused
   while it stays byte-identical, so the breakpoint moved on every request: each
-  turn wrote a fresh cache entry and read none back, paying the write premium for
-  no benefit. It now sits on the part of the system prompt that survives between
-  turns, with the recalled context after it where it is free to vary.
+  turn wrote a fresh cache entry and read none back, paying the write premium
+  for no benefit. It now sits on the part of the system prompt that survives
+  between turns, with the recalled context after it where it is free to vary.
   `LLMContext.SystemParts` exposes that split.
 - **The Pion transport sends on every frame boundary for the life of the
   session**, falling back to silence when nothing is queued, instead of writing
   only when the pipeline handed it audio. RTP timestamps advance one frame per
-  packet however much wall clock passed, so a sender that went quiet during a gap
-  — the pause between one synthesized sentence and the next — and then resumed
-  left the audio after it timestamped as though the gap never happened. Receivers
-  schedule playout from those timestamps, so the gap read as network delay:
-  conceal by repeating the last frame, then compress once packets bunched up
-  again, heard as stuttered and clipped words. With the sender writing every
+  packet however much wall clock passed, so a sender that went quiet during a
+  gap — the pause between one synthesized sentence and the next — and then
+  resumed left the audio after it timestamped as though the gap never happened.
+  Receivers schedule playout from those timestamps, so the gap read as network
+  delay: conceal by repeating the last frame, then compress once packets bunched
+  up again, heard as stuttered and clipped words. With the sender writing every
   frame, elapsed frames and elapsed time cannot diverge. This is the shape
-  `transport/localaudio` already had, since a device's playback callback pulls on
-  its own clock and has to be given something; `transport/pionrtc` could push
+  `transport/localaudio` already had, since a device's playback callback pulls
+  on its own clock and has to be given something; `transport/pionrtc` could push
   instead, and drifted. `transport/livekit` still pushes and is likely affected,
   but is untested here.
 - **The `libopus` encoder rejects wrong-sized frames** instead of reading past
-  the end of the caller's buffer: `opus_encode` consumes a fixed frame regardless
-  of the slice length, so a short frame read out of bounds. It now returns the
-  same error the pure-Go encoder does, as the shared API promises.
+  the end of the caller's buffer: `opus_encode` consumes a fixed frame
+  regardless of the slice length, so a short frame read out of bounds. It now
+  returns the same error the pure-Go encoder does, as the shared API promises.
 
 ### Added
 
@@ -3957,23 +4002,23 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   prompt/response modality detail into the breakdown) and the OpenAI Realtime
   service parses the `response.done` usage (input/output token details incl.
   audio); both report through a shared `processor.Base.PushTokenUsage`, so
-  realtime token usage reaches the in-band `MetricsFrame`, the aggregate metrics,
-  and telemetry spans. Token attributes are written under the OpenTelemetry
-  GenAI `gen_ai.usage.*` keys (with the audio/text/cache breakdowns added when
-  nonzero) alongside the legacy `llm.tokens.*` keys, unified for the cascaded
-  and realtime paths. Nova Sonic's bidirectional stream carries no usage event,
-  so it reports none.
+  realtime token usage reaches the in-band `MetricsFrame`, the aggregate
+  metrics, and telemetry spans. Token attributes are written under the
+  OpenTelemetry GenAI `gen_ai.usage.*` keys (with the audio/text/cache
+  breakdowns added when nonzero) alongside the legacy `llm.tokens.*` keys,
+  unified for the cascaded and realtime paths. Nova Sonic's bidirectional stream
+  carries no usage event, so it reports none.
 
 - **Priceable STT and TTS spans.** Speech spans now carry what a cost-tracking
   backend needs to price them, so a trace shows the cost of the whole turn
   rather than of its LLM call alone. Each synthesis records the provider model
   and its character count; each transcription records the model and the duration
   of audio sent. A provider reports its model through the new optional
-  `tts.Describer` (returning a `tts.Metadata`) or through `Model` on the existing
-  `stt.Metadata` — ElevenLabs, Deepgram (including Flux), Cartesia, NVIDIA and
-  Gradium do; a provider that reports none is unchanged apart from the
-  operation name. Streaming STT reports usage once per session, covering all the
-  audio the connection carried (silence included, which is what streaming
+  `tts.Describer` (returning a `tts.Metadata`) or through `Model` on the
+  existing `stt.Metadata` — ElevenLabs, Deepgram (including Flux), Cartesia,
+  NVIDIA and Gradium do; a provider that reports none is unchanged apart from
+  the operation name. Streaming STT reports usage once per session, covering all
+  the audio the connection carried (silence included, which is what streaming
   providers bill for); batch STT reports per transcribed segment. Usage is
   written as OpenTelemetry GenAI `gen_ai.*` attributes plus
   `langfuse.observation.usage_details`, since the GenAI conventions model usage
@@ -3985,21 +4030,25 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - **Behavioral eval harness** (`eval`) and a **`jargo` CLI** (`cmd/jargo`). The
   harness drives a real bot over RTVI, plays scripted conversation turns from a
   YAML scenario, and asserts on the semantic events the bot emits. Scenarios run
-  two ways off one core: in-process from a Go test with `eval.Run(t, path,
-  buildBot)` (the bot hosted on a loopback WebSocket via `eval.Handler`), or from
-  the command line against a running bot with `jargo eval run <scenario.yaml>
-  --bot-url ws://…`. This first iteration covers text-mode scenarios — each user
-  turn is delivered as RTVI `send-text`, and expectations match `llm_started`,
-  `llm_response` (`text_contains` or an LLM `judge`), and `function_call`
-  events in order, each within a `within_ms` latency budget. A `judge:` criterion
-  is graded by an LLM judge (`eval.NewLLMJudge`, backed by any jargo LLM service;
+  two ways off one core: in-process from a Go test with
+  `eval.Run(t, path,
+  buildBot)` (the bot hosted on a loopback WebSocket via
+  `eval.Handler`), or from the command line against a running bot with
+  `jargo eval run <scenario.yaml>
+  --bot-url ws://…`. This first iteration
+  covers text-mode scenarios — each user turn is delivered as RTVI `send-text`,
+  and expectations match `llm_started`, `llm_response` (`text_contains` or an
+  LLM `judge`), and `function_call` events in order, each within a `within_ms`
+  latency budget. A `judge:` criterion is graded by an LLM judge
+  (`eval.NewLLMJudge`, backed by any jargo LLM service;
   `jargo eval run --judge-model …` for the CLI), with verdicts cached per
   (criterion, reply). **Audio mode** (`Options.UserTTS`) synthesizes each user
-  turn and streams it to the bot as microphone audio at real-time cadence, so the
-  bot's real VAD, turn detection and STT run — unlocking `user_started_speaking`,
-  `user_stopped_speaking` and `user_transcription` assertions. **`jargo eval
-  suite <manifest.yaml>`** runs many scenarios across bots concurrently and prints
-  an aggregate summary.
+  turn and streams it to the bot as microphone audio at real-time cadence, so
+  the bot's real VAD, turn detection and STT run — unlocking
+  `user_started_speaking`, `user_stopped_speaking` and `user_transcription`
+  assertions. **`jargo eval
+  suite <manifest.yaml>`** runs many scenarios
+  across bots concurrently and prints an aggregate summary.
 - **RTVI text input and richer event surface** (`processor/rtvi`): the processor
   now handles an inbound `send-text` message (appending a user turn and running
   the LLM), and emits `bot-llm-started`/`bot-llm-stopped`,
@@ -4011,35 +4060,36 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   plus inbound microphone audio (`raw-audio` → `InputAudioRawFrame`) — over a
   plain WebSocket, so a client can drive a bot without WebRTC.
 - **NVIDIA Riva streaming STT** (`provider/nvidia`): `NewSTT` adds a gRPC
-  streaming speech-to-text service that talks to NVIDIA's hosted ASR endpoint
-  or a locally deployed Riva/NIM model (such as parakeet), selected through
+  streaming speech-to-text service that talks to NVIDIA's hosted ASR endpoint or
+  a locally deployed Riva/NIM model (such as parakeet), selected through
   `Server`/`UseSSL` and the `APIKey`/`FunctionID` auth fields. Emits interim and
   finalized `TranscriptionFrame`s, with Riva's server-side endpointing driving
   the end-of-turn signal, and exposes optional endpointing tuning. The generated
   Riva gRPC client lives in `provider/nvidia/internal/rivapb`.
 - **Telephony serializers for Plivo, Telnyx, and Exotel.** Three new
-  `wsserver.Serializer` implementations alongside the existing Twilio one:
-  Plivo (`transport/wsserver/plivo`, μ-law with REST auto-hang-up), Telnyx
+  `wsserver.Serializer` implementations alongside the existing Twilio one: Plivo
+  (`transport/wsserver/plivo`, μ-law with REST auto-hang-up), Telnyx
   (`transport/wsserver/telnyx`, μ-law **and** A-law, receive encoding learned
   from the stream, REST auto-hang-up), and Exotel (`transport/wsserver/exotel`,
   raw 16-bit PCM). Each learns its stream/call identifiers from the inbound
   `start` message and emits a barge-in clear on interruption.
 - **G.711 A-law codec** (`audio/g711`): `EncodeALaw`/`DecodeALaw` join the
   existing μ-law pair, for PSTN audio outside North America (Telnyx PCMA).
-- **TTS text normalization** (`utils/text/`): a pluggable `text.Filter` layer that
-  rewrites written text into a more speakable form before synthesis — strips
-  Markdown, spells out numbers, currency, percentages, dates, and units, spaces
-  out phone-number digits and acronyms, and reads email addresses aloud. A
-  `text.VoiceFormatter` bundles a configurable, ordered pipeline of these
+- **TTS text normalization** (`utils/text/`): a pluggable `text.Filter` layer
+  that rewrites written text into a more speakable form before synthesis —
+  strips Markdown, spells out numbers, currency, percentages, dates, and units,
+  spaces out phone-number digits and acronyms, and reads email addresses aloud.
+  A `text.VoiceFormatter` bundles a configurable, ordered pipeline of these
   transforms; attach it with the new `(*tts.Base).SetTextFilters`, promoted to
   every TTS service. English number spelling follows the `num2words` "en"
   conventions and needs no external dependency.
 - **Local-audio transport** (`transport/localaudio`): capture from the local
   microphone and play back through the local speaker, for running a bot on the
   same machine with no browser or telephony leg. It speaks the PulseAudio native
-  protocol through the pure-Go [`github.com/jfreymuth/pulse`](https://github.com/jfreymuth/pulse)
-  client, so the default build stays cgo-free; it needs a running PulseAudio or
-  PipeWire (pulse-compatible) server. See `examples/localaudio` for a no-keys
+  protocol through the pure-Go
+  [`github.com/jfreymuth/pulse`](https://github.com/jfreymuth/pulse) client, so
+  the default build stays cgo-free; it needs a running PulseAudio or PipeWire
+  (pulse-compatible) server. See `examples/localaudio` for a no-keys
   microphone-to-speaker echo.
 
 ### Changed
@@ -4059,17 +4109,17 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - **Trailing audio dropped at turn ends** (`transport`): the base output
   transport buffers audio into fixed-size chunks and used to leave the final
   sub-chunk of a turn sitting in the buffer, where a barge-in would clear it —
-  clipping the last few milliseconds of the bot's utterance. The remainder is now
-  padded to a full chunk with silence and flushed when the turn ends, so it plays
-  out. Padding lets the tail pass through downstream whole-frame encoders (Opus)
-  that would otherwise strand a short frame. A barge-in still discards the pending
-  tail, as it must.
+  clipping the last few milliseconds of the bot's utterance. The remainder is
+  now padded to a full chunk with silence and flushed when the turn ends, so it
+  plays out. Padding lets the tail pass through downstream whole-frame encoders
+  (Opus) that would otherwise strand a short frame. A barge-in still discards
+  the pending tail, as it must.
 
 - **Anthropic/Bedrock assistant-prefill constraint** (`provider/anthropic`): the
   Claude 4.6-generation models (Opus 4.8, Sonnet 4.6, …) reject a request whose
-  message list ends with an assistant message. When the configured model does not
-  support prefill, the service now appends a minimal `.` user message to such
-  requests at send time; the stored `LLMContext` is left untouched. Prefill
+  message list ends with an assistant message. When the configured model does
+  not support prefill, the service now appends a minimal `.` user message to
+  such requests at send time; the stored `LLMContext` is left untouched. Prefill
   support is detected from a frozen allow-list of the models known to still
   accept it, so every current and future no-prefill model is covered by default.
   Bedrock is fixed by the same change, since it runs on the Anthropic service.
@@ -4080,11 +4130,12 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 - **Service self-description and time-to-first-audio.** STT, TTS, and LLM
   services broadcast a metadata frame at pipeline start — an STT service can
-  recommend external turn strategies — and the TTS base reports time-to-first-audio
-  (the first *audible* sample, via a pure-Go speech-onset detector) alongside the
-  existing time-to-first-byte.
+  recommend external turn strategies — and the TTS base reports
+  time-to-first-audio (the first _audible_ sample, via a pure-Go speech-onset
+  detector) alongside the existing time-to-first-byte.
 - **Pipeline observers** (`observers/`): turn tracking, user-to-bot latency,
-  startup timing, and a frame logger, wired into the task's frame-observation hook.
+  startup timing, and a frame logger, wired into the task's frame-observation
+  hook.
 - **Audio recording** (`processor/audiobuffer`): a track-synced recorder with an
   auto-start option plus start/stop-recording control frames and events.
 - **Audio mixer, DTMF, and composable noise filters.** An output mixer
@@ -4114,20 +4165,23 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Added
 
-- **Pure-Go ONNX Runtime backend.** `internal/onnxrt` now has two interchangeable
-  backends behind one API: the default cgo binding (`yalue/onnxruntime_go`) and a
-  cgo-free binding built on [`ebitengine/purego`](https://github.com/ebitengine/purego)
-  that calls the ONNX Runtime C API directly, selected by a `CGO_ENABLED=0` build.
-  Both load the runtime shared library at run time; VAD and end-of-turn produce
+- **Pure-Go ONNX Runtime backend.** `internal/onnxrt` now has two
+  interchangeable backends behind one API: the default cgo binding
+  (`yalue/onnxruntime_go`) and a cgo-free binding built on
+  [`ebitengine/purego`](https://github.com/ebitengine/purego) that calls the
+  ONNX Runtime C API directly, selected by a `CGO_ENABLED=0` build. Both load
+  the runtime shared library at run time; VAD and end-of-turn produce
   bit-for-bit the same results either way. `onnxrt.NewWithOptions` adds an
-  `IntraOpThreads` cap (useful when many per-stream sessions would otherwise each
-  spawn a core-sized thread pool), and `onnxrt.Backend()` reports the active binding.
+  `IntraOpThreads` cap (useful when many per-stream sessions would otherwise
+  each spawn a core-sized thread pool), and `onnxrt.Backend()` reports the
+  active binding.
 
 - **Outbound telephony example** — `examples/twilio/outbound` places an outbound
   Twilio call (via the REST API, no Twilio SDK dependency), runs an STT → LLM →
   TTS pipeline over the media stream, collects a few details through a
   `record_info` tool call, then says goodbye and hangs up. Configured by a YAML
-  file (`-config`, see `config.example.yaml`) with environment-variable overrides.
+  file (`-config`, see `config.example.yaml`) with environment-variable
+  overrides.
 
 ### Changed
 
@@ -4140,14 +4194,15 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   `libsoxr-dev`. Build with `-tags libsoxr` to link libsoxr (the SoX Resampler)
   for its highest-quality polyphase conversion instead. The `New`/`Process`/
   `Close` API is unchanged, so callers need no updates.
-- **Noise reduction (RNNoise) no longer needs cgo or a build tag.** `audio/rnnoise`
-  binds librnnoise through [`ebitengine/purego`](https://github.com/ebitengine/purego)
-  and loads it at run time, so it builds in every configuration and is selected at
-  runtime by setting it as the transport's `AudioInFilter` — like any STT/LLM
-  service. `New` returns `ErrNotAvailable` when librnnoise is absent (point at a
-  non-standard install with `JARGO_RNNOISE_LIB`); the `-tags rnnoise` build tag and
-  the passthrough stub are gone. Together with the ONNX backend, the default build
-  is now fully cgo-free — `CGO_ENABLED=0 go build ./...` works.
+- **Noise reduction (RNNoise) no longer needs cgo or a build tag.**
+  `audio/rnnoise` binds librnnoise through
+  [`ebitengine/purego`](https://github.com/ebitengine/purego) and loads it at
+  run time, so it builds in every configuration and is selected at runtime by
+  setting it as the transport's `AudioInFilter` — like any STT/LLM service.
+  `New` returns `ErrNotAvailable` when librnnoise is absent (point at a
+  non-standard install with `JARGO_RNNOISE_LIB`); the `-tags rnnoise` build tag
+  and the passthrough stub are gone. Together with the ONNX backend, the default
+  build is now fully cgo-free — `CGO_ENABLED=0 go build ./...` works.
 - Bumped `github.com/pion/opus` to upstream `main`, pulling in the latest CELT
   encoder quality work (pitch pre-filter, post-filter, dynalloc), which the
   pure-Go encoder builds on.
@@ -4171,8 +4226,8 @@ framework for Go, ported from [Pipecat](https://github.com/pipecat-ai/pipecat).
 - **WebRTC transport** — pure-Go [Pion](https://github.com/pion); audio in and
   out of the browser, with RTVI riding the data channel for interoperability
   with existing RTVI clients.
-- **Voice pipeline** — streaming STT → LLM → TTS with prompt caching, plus
-  LLM function/tool calling.
+- **Voice pipeline** — streaming STT → LLM → TTS with prompt caching, plus LLM
+  function/tool calling.
 - **Turn-taking & barge-in** — Silero VAD + Smart Turn v3 end-of-turn detection
   via local ONNX, with a user-idle watchdog.
 - **Speech-to-speech** — single-model voice agents: OpenAI Realtime, Gemini

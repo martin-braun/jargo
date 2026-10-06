@@ -2,6 +2,7 @@ package chat
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -28,6 +29,11 @@ type TTSConfig struct {
 	Model string
 	// Voice is the voice name; empty uses a default voice.
 	Voice string
+	// SampleRate describes the raw PCM16 response in Hz; 0 uses 24000.
+	// It labels the received audio, not the transport output or an API request.
+	SampleRate int `validate:"gte=0"`
+	// Channels describes the interleaved PCM16 response; 0 uses mono.
+	Channels int `validate:"omitempty,oneof=1 2"`
 	// Instructions guide the voice synthesis behavior; empty omits it.
 	Instructions string
 	// Speed controls the speaking rate (0.25 to 4.0); nil omits it.
@@ -68,12 +74,17 @@ type synthesizer struct {
 	http *http.Client
 }
 
-// SampleRate reports OpenAI's fixed PCM output rate.
-func (s *synthesizer) SampleRate() int { return ttsSampleRate }
+// SampleRate reports the source PCM rate, before transport resampling.
+func (s *synthesizer) SampleRate() int { return cmp.Or(s.cfg.SampleRate, ttsSampleRate) }
 
 // Synthesize requests speech for text and streams the raw PCM downstream.
 func (s *synthesizer) RunTTS(ctx context.Context, text, _ string, yield func(f frames.Frame) error) error {
-	emit := tts.PCMYielder(yield, s.SampleRate())
+	emit := func(pcm []byte) error {
+		if len(pcm) == 0 {
+			return nil
+		}
+		return yield(frames.NewTTSAudioRawFrame(pcm, s.SampleRate(), cmp.Or(s.cfg.Channels, 1)))
+	}
 	payload := map[string]any{
 		"model":           s.cfg.Model,
 		"voice":           s.cfg.Voice,

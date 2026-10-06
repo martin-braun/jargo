@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>jargo · custom voice</title>
+    <style>
+    body {
+      font-family: system-ui, sans-serif;
+      max-width: 36rem;
+      margin: 4rem auto;
+      padding: 0 1rem;
+    }
+    button {
+      font-size: 1rem;
+      padding: 0.6rem 1.2rem;
+      cursor: pointer;
+    }
+    </style>
+  </head>
+  <body>
+    <h1>jargo custom voice</h1>
+    <p>
+      Start, allow your microphone, then speak. Pause to finish each turn.
+      Headphones help prevent feedback. Use the audio controls if autoplay is
+      blocked.
+    </p>
+    <button id="start">Start</button>
+    <button id="stop" disabled>Disconnect</button>
+    <p id="status" role="status">idle</p>
+    <audio id="remote" autoplay controls></audio>
+    <script>
+    const start = document.getElementById("start");
+      const stop = document.getElementById("stop");
+      const remote = document.getElementById("remote");
+      const status = (text) => {
+        document.getElementById("status").textContent = text;
+      };
+      let session;
+
+      function disconnect(text = "disconnected") {
+        const old = session;
+        session = undefined;
+        old?.abort.abort();
+        old?.pc?.close();
+        old?.stream?.getTracks().forEach((track) => track.stop());
+        remote.srcObject = null;
+        start.disabled = false;
+        stop.disabled = true;
+        status(text);
+      }
+
+      stop.onclick = () => disconnect();
+      window.addEventListener("pagehide", () => disconnect());
+      start.onclick = async () => {
+        const current = { abort: new AbortController() };
+        session = current;
+        start.disabled = true;
+        stop.disabled = false;
+        try {
+          status("requesting microphone…");
+          const configResponse = await fetch("/audio-config", {
+            signal: current.abort.signal,
+          });
+          if (!configResponse.ok) {
+            throw new Error("Cannot load microphone settings");
+          }
+          const audioConfig = await configResponse.json();
+          if (session !== current) return;
+          // Capture constraints are preferences; the decoder guarantees the STT format.
+          const stream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              sampleRate: { ideal: audioConfig.sample_rate },
+              channelCount: { ideal: audioConfig.channels },
+            },
+          });
+          if (session !== current) {
+            stream.getTracks().forEach((track) => track.stop());
+            return;
+          }
+          current.stream = stream;
+          const pc = new RTCPeerConnection({ iceServers: [] });
+          current.pc = pc;
+          stream.getTracks().forEach((track) =>
+            pc.addTrack(track, stream)
+          );
+          pc.ontrack = (event) => {
+            if (session !== current) return;
+            remote.srcObject = event.streams[0]
+              || new MediaStream([event.track]);
+            remote.play().catch(() => {
+              if (session === current) {
+                status(
+                  "Audio blocked: press play on the audio controls.",
+                );
+              }
+            });
+          };
+          pc.onconnectionstatechange = () => {
+            if (session !== current) return;
+            if (
+              ["failed", "disconnected", "closed"].includes(
+                pc.connectionState,
+              )
+            ) {
+              disconnect("connection: " + pc.connectionState);
+            } else {
+              status(
+                pc.connectionState === "connected"
+                  ? "connected — speak, then pause"
+                  : "connection: " + pc.connectionState,
+              );
+            }
+          };
+          // Diagnostic messages only; no RTVI handshake gates audio.
+          const dc = pc.createDataChannel("status");
+          dc.onmessage = (event) => {
+            if (session !== current) return;
+            try {
+              const message = JSON.parse(event.data);
+              if (message.type === "error") status(message.message);
+            } catch {
+              status("Invalid server status message");
+            }
+          };
+          await pc.setLocalDescription(await pc.createOffer());
+          await new Promise((resolve, reject) => {
+            const timer = setTimeout(
+              () => reject(new Error("ICE gathering timed out")),
+              10000,
+            );
+            const finish = () => {
+              clearTimeout(timer);
+              resolve();
+            };
+            if (pc.iceGatheringState === "complete") finish();
+            else {pc.onicegatheringstatechange = () => {
+                if (pc.iceGatheringState === "complete") finish();
+              };}
+            current.abort.signal.addEventListener("abort", () => {
+              clearTimeout(timer);
+              reject(new Error("disconnected"));
+            }, { once: true });
+          });
+          if (session !== current) return;
+          status("signaling…");
+          const response = await fetch("/offer", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(pc.localDescription),
+            signal: current.abort.signal,
+          });
+          if (!response.ok) throw new Error(await response.text());
+          if (session !== current) return;
+          await pc.setRemoteDescription(await response.json());
+        } catch (error) {
+          if (session === current) disconnect("error: " + error.message);
+        }
+      };
+    </script>
+  </body>
+</html>

@@ -134,6 +134,26 @@ func TestBaseOutputRebuildsTheResamplerWhenTheInputRateChanges(t *testing.T) {
 	}
 }
 
+func TestBaseOutputResamplesTTSFrom44100(t *testing.T) {
+	params := transport.DefaultParams()
+	params.AudioOutSampleRate = 48000
+	params.AudioOutEndSilenceSecs = 0
+	o := newFakeOutput(params)
+	task, stop := startFakeOutput(t, o)
+	defer stop()
+
+	// One second of source PCM, labeled by the TTS provider.
+	task.QueueFrame(frames.NewTTSAudioRawFrame(dcPCM(44100*2), 44100, 1))
+	got := drainWrites(t, o, 200*time.Millisecond)
+	// Allow buffered filter/chunk tails, but reject unchanged or 24 kHz-labeled PCM.
+	if len(got) < 48000*2-2*1920 || len(got) > 48000*2 {
+		t.Errorf("resampled TTS = %d bytes, want about 96000", len(got))
+	}
+	if allZero(got) {
+		t.Error("resampled TTS is silent")
+	}
+}
+
 // allZero reports whether pcm is entirely silence.
 func allZero(pcm []byte) bool {
 	for _, b := range pcm {

@@ -1,9 +1,8 @@
 // Package opus wraps the Opus codec for jargo's audio path: it decodes Opus
 // packets to PCM on the way in and encodes PCM to Opus packets on the way out.
 //
-// The codec runs at 48 kHz — the rate WebRTC negotiates for Opus — so audio
-// crosses the transport without resampling. Encoding produces 20 ms frames, the
-// standard WebRTC packetization.
+// Encoding runs at 48 kHz and produces 20 ms frames, the standard WebRTC
+// packetization. Decoding can output the rate needed by the input pipeline.
 //
 // Both the decoder and the encoder are pure Go, so the package needs no cgo:
 // the decoder handles every Opus mode, and the encoder emits wideband SILK
@@ -55,7 +54,13 @@ type Decoder struct {
 // NewDecoder builds a Decoder that outputs channels-channel 48 kHz PCM. It
 // decodes all Opus modes (SILK, CELT and hybrid).
 func NewDecoder(channels int) (*Decoder, error) {
-	d, err := pion.NewDecoderWithOutput(SampleRate, channels)
+	return NewDecoderWithOutput(SampleRate, channels)
+}
+
+// NewDecoderWithOutput decodes directly to the requested PCM format. Supported
+// rates are 8000, 12000, 16000, 24000 and 48000 Hz; channels is 1 or 2.
+func NewDecoderWithOutput(sampleRate, channels int) (*Decoder, error) {
+	d, err := pion.NewDecoderWithOutput(sampleRate, channels)
 	if err != nil {
 		return nil, fmt.Errorf("new opus decoder: %w", err)
 	}

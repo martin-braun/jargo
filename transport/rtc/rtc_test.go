@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"math"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -23,6 +24,7 @@ import (
 // echoProcessor turns received audio frames into outgoing audio frames.
 type echoProcessor struct {
 	*processor.Base
+	input chan *frames.InputAudioRawFrame
 }
 
 func newEcho() *echoProcessor {
@@ -36,6 +38,10 @@ func (e *echoProcessor) ProcessFrame(ctx context.Context, f frames.Frame, dir pr
 		return err
 	}
 	if in, ok := f.(*frames.InputAudioRawFrame); ok {
+		select {
+		case e.input <- in:
+		default:
+		}
 		out := frames.NewOutputAudioRawFrame(in.Audio, in.SampleRate, in.NumChannels)
 		return e.PushFrame(ctx, out, processor.Downstream)
 	}
@@ -46,6 +52,13 @@ func (e *echoProcessor) ProcessFrame(ctx context.Context, f frames.Frame, dir pr
 // peers: a client sends Opus audio, the jargo echo pipeline decodes, echoes and
 // re-encodes it, and the client must receive audio back.
 func TestWebRTCEchoLoopback(t *testing.T) {
+	for _, rate := range []int{16000, opus.SampleRate} {
+		t.Run(strconv.Itoa(rate), func(t *testing.T) { runWebRTCEchoLoopback(t, rate) })
+	}
+}
+
+func runWebRTCEchoLoopback(t *testing.T, inputRate int) {
+	t.Helper()
 	// Server side: a jargo connection with no STUN (host candidates only).
 	server, err := rtc.NewConnection(rtc.WithICEServers())
 	if err != nil {
@@ -113,12 +126,14 @@ func TestWebRTCEchoLoopback(t *testing.T) {
 
 	// Run the echo pipeline on the server connection.
 	params := transport.DefaultParams()
-	params.AudioInSampleRate = opus.SampleRate
+	params.AudioInSampleRate = inputRate
 	params.AudioOutSampleRate = opus.SampleRate
 	tr := rtc.NewTransport(server, params)
-	task := pipeline.NewWorker(pipeline.New(tr.Input(), newEcho(), tr.Output()), pipeline.WorkerConfig{
+	echo := newEcho()
+	echo.input = make(chan *frames.InputAudioRawFrame, 1)
+	task := pipeline.NewWorker(pipeline.New(tr.Input(), echo, tr.Output()), pipeline.WorkerConfig{
 		Params: pipeline.Params{
-			AudioInSampleRate:  opus.SampleRate,
+			AudioInSampleRate:  inputRate,
 			AudioOutSampleRate: opus.SampleRate,
 		},
 	})
@@ -154,6 +169,14 @@ func TestWebRTCEchoLoopback(t *testing.T) {
 	select {
 	case <-gotAudio:
 		// Echoed audio crossed the full transport.
+		select {
+		case in := <-echo.input:
+			if in.SampleRate != inputRate || in.NumChannels != 1 || len(in.Audio) != inputRate/50*2 {
+				t.Errorf("input format = %d Hz, %d channels, %d bytes", in.SampleRate, in.NumChannels, len(in.Audio))
+			}
+		case <-time.After(15 * time.Second):
+			t.Fatal("did not receive decoded input within 15s")
+		}
 	case <-time.After(15 * time.Second):
 		t.Fatal("did not receive echoed audio within 15s")
 	}

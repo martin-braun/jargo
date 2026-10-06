@@ -68,12 +68,72 @@ func TestTTSConfigValidate(t *testing.T) {
 	}
 }
 
-// TestSynthesizerSampleRate checks the service reports the rate OpenAI's "pcm"
-// response format is fixed at, since nothing in the response declares it.
+// TestSynthesizerSampleRate checks the default source rate.
 func TestSynthesizerSampleRate(t *testing.T) {
 	s := &synthesizer{}
 	if got := s.SampleRate(); got != ttsSampleRate {
 		t.Errorf("SampleRate() = %d, want %d", got, ttsSampleRate)
+	}
+}
+
+func TestRunTTSPCMFormat(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		cfg            TTSConfig
+		rate, channels int
+	}{
+		{"default", TTSConfig{}, 24000, 1},
+		{"configured mono", TTSConfig{SampleRate: 44100, Channels: 1}, 44100, 1},
+		{"configured stereo metadata", TTSConfig{SampleRate: 44100, Channels: 2}, 44100, 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			want := bytes.Repeat([]byte{0x11, 0x22}, 64)
+			srv, _, body := newTTSServer(t, want)
+			tc.cfg.BaseURL = srv.URL
+			s := &synthesizer{cfg: tc.cfg, http: srv.Client()}
+			if got := s.SampleRate(); got != tc.rate {
+				t.Errorf("SampleRate() = %d, want %d", got, tc.rate)
+			}
+			var pcm bytes.Buffer
+			err := s.RunTTS(t.Context(), "hello", "", func(f frames.Frame) error {
+				audio, ok := f.(*frames.TTSAudioRawFrame)
+				if !ok {
+					t.Errorf("frame = %T, want TTSAudioRawFrame", f)
+					return nil
+				}
+				if audio.SampleRate != tc.rate || audio.NumChannels != tc.channels {
+					t.Errorf("PCM format = %d/%d, want %d/%d", audio.SampleRate, audio.NumChannels, tc.rate, tc.channels)
+				}
+				pcm.Write(audio.Audio)
+				return nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(pcm.Bytes(), want) {
+				t.Error("PCM payload changed")
+			}
+			if (*body)["response_format"] != "pcm" {
+				t.Errorf("response_format = %v, want pcm", (*body)["response_format"])
+			}
+			for _, key := range []string{"sample_rate", "channels"} {
+				if _, ok := (*body)[key]; ok {
+					t.Errorf("unexpected format negotiation field %s", key)
+				}
+			}
+		})
+	}
+}
+
+func TestTTSConfigRejectsInvalidPCMFormat(t *testing.T) {
+	for _, cfg := range []TTSConfig{
+		{APIKey: "k", SampleRate: -1},
+		{APIKey: "k", Channels: -1},
+		{APIKey: "k", Channels: 3},
+	} {
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("Validate() for PCM %d/%d = nil, want error", cfg.SampleRate, cfg.Channels)
+		}
 	}
 }
 

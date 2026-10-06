@@ -68,7 +68,7 @@ func channels(n int) int {
 
 // StartReading decodes incoming audio on its own goroutine.
 func (in *inputTransport) StartReading(ctx context.Context) error {
-	dec, err := opus.NewDecoder(channels(in.Params().AudioInChannels))
+	dec, err := opus.NewDecoderWithOutput(in.SampleRate(), channels(in.Params().AudioInChannels))
 	if err != nil {
 		return err
 	}
@@ -151,7 +151,7 @@ func (in *inputTransport) readLoop(ctx context.Context) {
 		if err != nil {
 			continue
 		}
-		in.PushAudioFrame(ctx, frames.NewInputAudioRawFrame(pcm, opus.SampleRate, ch))
+		in.PushAudioFrame(ctx, frames.NewInputAudioRawFrame(pcm, in.SampleRate(), ch))
 	}
 }
 
